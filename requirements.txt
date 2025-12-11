@@ -1,0 +1,9 @@
+discord.py
+python-dotenv
+aiohttp
+Pillow
+fastapi
+uvicorn
+transformers
+torch
+timm

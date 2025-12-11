@@ -1,0 +1,12 @@
+{
+    "890882415080398878": {
+        "enabled": true,
+        "log_channel": 1286403646862528614,
+        "punishment": "timeout",
+        "timeout_duration": 1,
+        "ban_duration": null,
+        "nsfw_threshold": 51,
+        "whitelisted_roles": [],
+        "whitelisted_users": []
+    }
+}

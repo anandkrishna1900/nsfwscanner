@@ -1,0 +1,129 @@
+{
+    "852789725056204812": [
+        {
+            "case": 1,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 11:43:57"
+        },
+        {
+            "case": 2,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 11:47:05"
+        },
+        {
+            "case": 3,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 11:54:59"
+        },
+        {
+            "case": 4,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 11:58:39"
+        },
+        {
+            "case": 5,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 12:04:39"
+        },
+        {
+            "case": 6,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 12:07:57"
+        },
+        {
+            "case": 7,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 12:25:05"
+        },
+        {
+            "case": 8,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 12:44:25"
+        },
+        {
+            "case": 9,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 12:48:27"
+        },
+        {
+            "case": 10,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 12:55:39"
+        },
+        {
+            "case": 11,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 13:00:13"
+        },
+        {
+            "case": 12,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 13:55:58"
+        },
+        {
+            "case": 13,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 14:27:40"
+        },
+        {
+            "case": 14,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 14:35:23"
+        }
+    ],
+    "885621561774727198": [
+        {
+            "case": 1,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 11:43:58"
+        }
+    ],
+    "1353588081952821403": [
+        {
+            "case": 1,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 11:51:42"
+        }
+    ],
+    "1080467841960116345": [
+        {
+            "case": 1,
+            "action": "Timeout",
+            "reason": "NSFW content detected",
+            "by": "NSFW Detection AI",
+            "at": "2025-10-01 14:07:28"
+        }
+    ]
+}
