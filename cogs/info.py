@@ -1,3 +1,4 @@
+# cogs/info.py
 import discord
 from discord.ext import commands
 from database import get_modlogs, get_case
@@ -7,14 +8,14 @@ class Info(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="help")
+    @commands.hybrid_command(name="help", description="Show help for the bot.")
     async def help_command(self, ctx, category: str = None):
         """Custom help command"""
         if not category:
             # Main help embed
             em = discord.Embed(
                 title="🤖 Bot Commands",
-                description="Use `;help <category>` for detailed commands",
+                description="Use `/help <category>` for detailed commands",
                 color=discord.Color.blue()
             )
             em.add_field(
@@ -26,7 +27,7 @@ class Info(commands.Cog):
                       "`scanner` - Media scanner commands",
                 inline=False
             )
-            em.set_footer(text="Example: ;help info")
+            em.set_footer(text="Example: /help info")
             await ctx.send(embed=em)
             
         elif category.lower() == "info":
@@ -115,15 +116,15 @@ class Info(commands.Cog):
             
         else:
             await ctx.send(embed=discord.Embed(
-                description="❌ Invalid category! Use `;help` to see available categories.",
+                description="❌ Invalid category! Use `/help` to see available categories.",
                 color=discord.Color.red()
-            ))
+            ), ephemeral=True)
 
-    @commands.command()
+    @commands.hybrid_command(description="View modlogs for a user.")
     async def modlogs(self, ctx, user: discord.User):
-        rows = get_modlogs(user.id)
+        rows = await get_modlogs(user.id)
         if not rows:
-            await ctx.send(embed=discord.Embed(description="No logs found.", color=discord.Color.greyple()))
+            await ctx.send(embed=discord.Embed(description="No logs found.", color=discord.Color.greyple()), ephemeral=True)
             return
 
         em = discord.Embed(title=f"📜 Modlogs for {user}", color=discord.Color.blurple())
@@ -136,11 +137,11 @@ class Info(commands.Cog):
 
         await ctx.send(embed=em)
 
-    @commands.command()
+    @commands.hybrid_command(description="View details of a specific moderation case.")
     async def case(self, ctx, case_id: int):
-        row = get_case(case_id)
+        row = await get_case(case_id)
         if not row:
-            return await ctx.send(embed=discord.Embed(description="Case not found.", color=discord.Color.red()))
+            return await ctx.send(embed=discord.Embed(description="Case not found.", color=discord.Color.red()), ephemeral=True)
 
         cid, user_id, action, reason, mod_id, ts = row
         try:
@@ -157,11 +158,11 @@ class Info(commands.Cog):
         em.add_field(name="Action", value=action, inline=False)
         em.add_field(name="Reason", value=reason, inline=False)
         em.add_field(name="Moderator", value=f"{moderator} ({mod_id})", inline=False)
-        em.add_field(name="When", value=ts, inline=False)
+        em.add_field(name="When", value=str(ts), inline=False)
 
         await ctx.send(embed=em)
 
-    @commands.command()
+    @commands.hybrid_command(description="Show user information.")
     async def userinfo(self, ctx, member: discord.Member = None):
         member = member or ctx.author
         roles = [r.mention for r in member.roles if r != ctx.guild.default_role]
@@ -178,7 +179,7 @@ class Info(commands.Cog):
 
         await ctx.send(embed=em)
 
-    @commands.command()
+    @commands.hybrid_command(description="Show server information.")
     async def serverinfo(self, ctx):
         guild = ctx.guild
         em = discord.Embed(title=f"🏰 Server Info - {guild.name}", color=discord.Color.green())
@@ -194,7 +195,7 @@ class Info(commands.Cog):
 
         await ctx.send(embed=em)
 
-    @commands.command()
+    @commands.hybrid_command(description="Show user's avatar.")
     async def avatar(self, ctx, member: discord.Member = None):
         member = member or ctx.author
         em = discord.Embed(title=f"🖼️ Avatar - {member}", color=discord.Color.blurple())

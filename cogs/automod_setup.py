@@ -588,7 +588,7 @@ class AutoModSetup(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
     
-    @commands.command(name="setup")
+    @commands.hybrid_command(name="setup", description="Interactive setup wizard for NSFW scanner.")
     @commands.has_permissions(administrator=True)
     async def scanner_setup(self, ctx):
         """Interactive setup wizard for NSFW scanner"""

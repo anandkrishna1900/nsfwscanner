@@ -67,6 +67,7 @@ async def load_cogs():
         'cogs.moderation',
         'cogs.automod',
         'cogs.automod_setup',
+        'cogs.tasks',
         'cogs.errors'  # Global error handling
     ]
     for cog in cogs:
@@ -78,10 +79,32 @@ async def load_cogs():
 
 
 async def main():
+    import time
+    from database import init_db_pool, close_db
+    
+    bot.start_time = time.time()
+    
+    # Initialize Database
+    try:
+        await init_db_pool()
+    except Exception as e:
+        logger.critical(f"Failed to connect to database: {e}")
+        return
+
     async with bot:
         await load_cogs()
-        await bot.start(TOKEN)
+        try:
+            await bot.start(TOKEN)
+        except KeyboardInterrupt:
+            # Handle user interrupt
+            pass
+        finally:
+            await close_db()
+            logger.info("Bot shutdown complete.")
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

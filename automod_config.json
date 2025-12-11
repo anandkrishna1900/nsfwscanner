@@ -8,5 +8,15 @@
         "nsfw_threshold": 51,
         "whitelisted_roles": [],
         "whitelisted_users": []
+    },
+    "1443960186271305740": {
+        "enabled": true,
+        "punishment": "timeout",
+        "timeout_duration": 10,
+        "ban_duration": null,
+        "nsfw_threshold": 50,
+        "log_channel": null,
+        "whitelisted_roles": [],
+        "whitelisted_users": []
     }
 }

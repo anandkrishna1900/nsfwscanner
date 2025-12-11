@@ -192,7 +192,8 @@ class AutoMod(commands.Cog):
             # Use database instead of JSON
             from database import add_modlog
             # moderator_id is None/0 for AI/AutoMod
-            add_modlog(user.id, action, reason, self.bot.user.id)
+            # For postgres, ensure user.id is int
+            await add_modlog(user.id, action, reason, self.bot.user.id)
             logger.info(f"📝 Logged action to database: {action} for {user}")
         except Exception as e:
             logger.error(f"❌ Failed to log to database: {e}")
@@ -418,7 +419,7 @@ class AutoMod(commands.Cog):
         except Exception as e:
             logger.error(f"❌ Punishment failed: {e}")
     
-    @commands.group(invoke_without_command=True)
+    @commands.hybrid_group(invoke_without_command=True, name="scanner", description="NSFW Scanner configuration")
     @commands.has_permissions(manage_messages=True)
     async def scanner(self, ctx):
         """Scanner status and configuration"""
@@ -478,11 +479,11 @@ class AutoMod(commands.Cog):
                 em.add_field(name="Whitelisted Roles", value=f"{len(whitelisted_roles)} role(s)", inline=True)
             
             em.add_field(name="Scans", value="Attachments, Embeds, URLs", inline=False)
-            em.set_footer(text="Use ;setup for interactive setup wizard")
+            em.set_footer(text="Use /scanner commands to configure")
             
             await ctx.send(embed=em)
     
-    @scanner.command()
+    @scanner.command(description="Enable/disable scanner")
     @commands.has_permissions(manage_messages=True)
     async def toggle(self, ctx):
         """Enable/disable scanner"""
@@ -492,31 +493,31 @@ class AutoMod(commands.Cog):
         status = "enabled" if config["enabled"] else "disabled"
         await ctx.send(f"✅ Scanner {status}")
     
-    @scanner.command()
+    @scanner.command(description="Set detection threshold (1-100)")
     @commands.has_permissions(manage_messages=True)
     async def threshold(self, ctx, percentage: int):
         """Set detection threshold (1-100)"""
         if not 1 <= percentage <= 100:
-            return await ctx.send("❌ Use 1-100")
+            return await ctx.send("❌ Use 1-100", ephemeral=True)
         
         config = self.get_server_config(ctx.guild.id)
         config["nsfw_threshold"] = percentage
         self.save_config()
         await ctx.send(f"✅ Threshold: {percentage}%")
     
-    @scanner.command()
+    @scanner.command(description="Set punishment type (none/kick/ban/timeout)")
     @commands.has_permissions(manage_messages=True)
     async def punishment(self, ctx, ptype: str):
         """Set punishment type (none/kick/ban/timeout)"""
         if ptype.lower() not in ["none", "kick", "ban", "timeout"]:
-            return await ctx.send("❌ Use: none, kick, ban, timeout")
+            return await ctx.send("❌ Use: none, kick, ban, timeout", ephemeral=True)
         
         config = self.get_server_config(ctx.guild.id)
         config["punishment"] = ptype.lower()
         self.save_config()
         await ctx.send(f"✅ Punishment: {ptype.lower()}")
     
-    @scanner.command()
+    @scanner.command(description="Set timeout duration")
     @commands.has_permissions(manage_messages=True)
     async def duration(self, ctx, duration: str):
         """Set timeout duration (e.g., 10m, 2h, 1d, 30s)"""
@@ -524,7 +525,7 @@ class AutoMod(commands.Cog):
         match = re.match(pattern, duration.lower())
         
         if not match:
-            return await ctx.send("❌ Invalid format! Use: `30s`, `10m`, `2h`, or `1d`")
+            return await ctx.send("❌ Invalid format! Use: `30s`, `10m`, `2h`, or `1d`", ephemeral=True)
         
         amount, unit = match.groups()
         amount = int(amount)
@@ -547,9 +548,9 @@ class AutoMod(commands.Cog):
             display = f"{amount} days"
         
         if minutes < 1:
-            return await ctx.send("❌ Minimum duration is 1 minute")
+            return await ctx.send("❌ Minimum duration is 1 minute", ephemeral=True)
         if minutes > 40320:
-            return await ctx.send("❌ Maximum duration is 28 days")
+            return await ctx.send("❌ Maximum duration is 28 days", ephemeral=True)
         
         config = self.get_server_config(ctx.guild.id)
         config["timeout_duration"] = int(minutes)
@@ -557,7 +558,7 @@ class AutoMod(commands.Cog):
         
         await ctx.send(f"✅ Timeout duration set to **{display}** ({int(minutes)} minutes)")
     
-    @scanner.command(name="logchannel")
+    @scanner.command(name="logchannel", description="Set log channel for NSFW detections")
     @commands.has_permissions(manage_messages=True)
     async def log_channel(self, ctx, channel: discord.TextChannel = None):
         """Set log channel for NSFW detections"""
@@ -590,20 +591,20 @@ class AutoMod(commands.Cog):
             )
             await channel.send(embed=welcome_embed)
     
-    @scanner.command()
+    @scanner.command(description="Test API connection")
     @commands.has_permissions(manage_messages=True)
     async def test(self, ctx):
         """Test API connection"""
-        await ctx.send("🔍 Testing API...")
+        await ctx.send("🔍 Testing API...", ephemeral=True)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get("http://127.0.0.1:8000/", timeout=5) as resp:
                     if resp.status == 200:
-                        await ctx.send("✅ API is online and working!")
+                        await ctx.send("✅ API is online and working!", ephemeral=True)
                     else:
-                        await ctx.send(f"⚠️ API returned status {resp.status}")
+                        await ctx.send(f"⚠️ API returned status {resp.status}", ephemeral=True)
         except:
-            await ctx.send("❌ API is offline. Make sure `scanner_api.py` is running!")
+            await ctx.send("❌ API is offline. Make sure `scanner_api.py` is running!", ephemeral=True)
     
     @commands.Cog.listener()
     async def on_message(self, message):
