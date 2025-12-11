@@ -22,7 +22,9 @@ def load_model():
         logger.info("Loading model...")
         try:
             from transformers import pipeline
-            classifier = pipeline("image-classification", model="Marqo/nsfw-image-detection-384")
+            # Falconsai is significantly more accurate. 
+            # If it's slow, it's likely the initial download or lack of image resizing.
+            classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
             logger.info("✅ Model loaded")
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
@@ -36,7 +38,7 @@ class URLRequest(BaseModel):
 def home():
     return {
         "status": "running",
-        "model": "Marqo NSFW Detection"
+        "model": "Falconsai/nsfw_image_detection"
     }
 
 @app.get("/health")
@@ -47,7 +49,7 @@ def health():
 async def scan(request: URLRequest):
     logger.info(f"Scanning {len(request.urls)} images")
     
-    # Load model
+    # Load model if not loaded
     try:
         model = load_model()
     except:
@@ -59,7 +61,7 @@ async def scan(request: URLRequest):
         try:
             # Download
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=15) as r:
+                async with session.get(url, timeout=10) as r:
                     if r.status != 200:
                         results.append({"url": url, "is_nsfw": False, "confidence_percentage": 0})
                         continue
@@ -67,6 +69,12 @@ async def scan(request: URLRequest):
             
             # Open image
             img = Image.open(BytesIO(data))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            
+            # CRITICAL OPTIMIZATION: Resize to 224x224 (Model's native input)
+            # This drastically reduces CPU processing time for large images
+            img = img.resize((224, 224))
             
             # Predict
             preds = model(img)
@@ -74,10 +82,13 @@ async def scan(request: URLRequest):
             # Find NSFW score
             nsfw_score = 0
             for p in preds:
-                if p['label'].lower() == 'nsfw':
+                label = p['label'].lower()
+                if label == 'nsfw':
                     nsfw_score = p['score'] * 100
+                    break
             
-            is_nsfw = nsfw_score > 50
+            # Default threshold is 5% in API, but server config usually overrides this
+            is_nsfw = nsfw_score > 5
             
             logger.info(f"Result: {'🚨 NSFW' if is_nsfw else '✅ Safe'} - {nsfw_score:.1f}%")
             
@@ -89,11 +100,17 @@ async def scan(request: URLRequest):
             })
             
         except Exception as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"Error processing {url}: {e}")
             results.append({"url": url, "is_nsfw": False, "confidence_percentage": 0})
     
     return results
 
 if __name__ == "__main__":
+    # Pre-load model on startup to prevent first-request lag
+    try:
+        load_model()
+    except Exception as e:
+        logger.warning(f"Could not pre-load model: {e}")
+
     logger.info("🚀 Starting API on port 8000")
     uvicorn.run(app, host="127.0.0.1", port=8000)
