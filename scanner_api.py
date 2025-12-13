@@ -12,24 +12,40 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="NSFW Scanner")
 
-# Global model
-classifier = None
+# Global models
+classifier_nsfw = None
+classifier_gore = None
 
-def load_model():
-    """Load Hugging Face model"""
-    global classifier
-    if classifier is None:
-        logger.info("Loading model...")
+def load_models():
+    """Load Hugging Face models"""
+    global classifier_nsfw, classifier_gore
+    
+    # 1. Load NSFW Model (Porn/Hentai vs Neutral/Sexy)
+    if classifier_nsfw is None:
+        logger.info("Loading NSFW model...")
         try:
             from transformers import pipeline
-            # Falconsai is significantly more accurate. 
-            # If it's slow, it's likely the initial download or lack of image resizing.
-            classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
-            logger.info("✅ Model loaded")
+            classifier_nsfw = pipeline("image-classification", model="LukeJacob2023/nsfw-image-detector")
+            logger.info("✅ NSFW Model loaded")
         except Exception as e:
-            logger.error(f"Failed to load model: {e}")
+            logger.error(f"Failed to load NSFW model: {e}")
             raise
-    return classifier
+
+    # 2. Load Gore/Violence Model
+    if classifier_gore is None:
+        logger.info("Loading Gore model...")
+        try:
+            from transformers import pipeline
+            # Using jaranohaal/vit-base-violence-detection for violence/gore
+            classifier_gore = pipeline("image-classification", model="jaranohaal/vit-base-violence-detection")
+            logger.info("✅ Gore Model loaded")
+        except Exception as e:
+            logger.error(f"Failed to load Gore model: {e}")
+            # Don't raise here, allow running with just NSFW if Gore fails? 
+            # Better to fail so we know it's broken.
+            raise
+            
+    return classifier_nsfw, classifier_gore
 
 class URLRequest(BaseModel):
     urls: List[str]
@@ -38,7 +54,10 @@ class URLRequest(BaseModel):
 def home():
     return {
         "status": "running",
-        "model": "Falconsai/nsfw_image_detection"
+        "models": [
+            "LukeJacob2023/nsfw-image-detector",
+            "jaranohaal/vit-base-violence-detection"
+        ]
     }
 
 @app.get("/health")
@@ -49,9 +68,9 @@ def health():
 async def scan(request: URLRequest):
     logger.info(f"Scanning {len(request.urls)} images")
     
-    # Load model if not loaded
+    # Load models if not loaded
     try:
-        model = load_model()
+        model_nsfw, model_gore = load_models()
     except:
         return [{"url": u, "is_nsfw": False, "confidence_percentage": 0} for u in request.urls]
     
@@ -73,30 +92,65 @@ async def scan(request: URLRequest):
                 img = img.convert("RGB")
             
             # CRITICAL OPTIMIZATION: Resize to 224x224 (Model's native input)
-            # This drastically reduces CPU processing time for large images
             img = img.resize((224, 224))
             
-            # Predict
-            preds = model(img)
+            # --- PREDICTION 1: NSFW (Porn/Hentai) ---
+            preds_nsfw = model_nsfw(img)
             
-            # Find NSFW score
             nsfw_score = 0
-            for p in preds:
+            detailed_detections = []
+            
+            for p in preds_nsfw:
                 label = p['label'].lower()
-                if label == 'nsfw':
-                    nsfw_score = p['score'] * 100
-                    break
+                score_pct = p['score'] * 100
+                
+                # Only aggregate Porn and Hentai. Ignore 'sexy', 'neutral', 'drawings'
+                if label in ['porn', 'hentai']:
+                    nsfw_score += score_pct
+                
+                detailed_detections.append({
+                    "class": label,
+                    "confidence": score_pct
+                })
+
+            # --- PREDICTION 2: GORE (Violence) ---
+            preds_gore = model_gore(img)
+            gore_score = 0
             
-            # Default threshold is 5% in API, but server config usually overrides this
-            is_nsfw = nsfw_score > 5
+            for p in preds_gore:
+                label = p['label'].lower()
+                score_pct = p['score'] * 100
+                
+                # Labels usually 'violence' vs 'non_violence' or 'violent'
+                if 'violence' in label or 'violent' in label:
+                    if 'non' not in label: # Exclude 'non_violence'
+                        gore_score = score_pct
+                        detailed_detections.append({
+                            "class": "gore",
+                            "confidence": score_pct
+                        })
             
-            logger.info(f"Result: {'🚨 NSFW' if is_nsfw else '✅ Safe'} - {nsfw_score:.1f}%")
+            # --- FINAL DECISION ---
+            # Max score determines the "confidence" we report
+            final_score = max(nsfw_score, gore_score)
+            
+            # Default threshold check
+            is_nsfw = final_score > 5
+            
+            status_emoji = "✅ Safe"
+            if is_nsfw:
+                if gore_score > nsfw_score:
+                    status_emoji = "🩸 GORE"
+                else:
+                    status_emoji = "🔞 NSFW"
+            
+            logger.info(f"Result: {status_emoji} - Max Score: {final_score:.1f}%")
             
             results.append({
                 "url": url,
                 "is_nsfw": is_nsfw,
-                "confidence_percentage": round(nsfw_score, 2),
-                "detections": [{"class": "NSFW", "confidence": nsfw_score}] if is_nsfw else []
+                "confidence_percentage": round(final_score, 2),
+                "detections": detailed_detections if is_nsfw else []
             })
             
         except Exception as e:
