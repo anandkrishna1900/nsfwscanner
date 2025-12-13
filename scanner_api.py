@@ -162,7 +162,7 @@ async def scan(request: URLRequest):
 if __name__ == "__main__":
     # Pre-load model on startup to prevent first-request lag
     try:
-        load_model()
+        load_models()
     except Exception as e:
         logger.warning(f"Could not pre-load model: {e}")
 
