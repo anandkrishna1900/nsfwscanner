@@ -1,3 +1,12 @@
+import os
+import warnings
+
+# Suppress warnings
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
@@ -12,40 +21,24 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="NSFW Scanner")
 
-# Global models
-classifier_nsfw = None
-classifier_gore = None
+# Global model
+classifier = None
 
-def load_models():
-    """Load Hugging Face models"""
-    global classifier_nsfw, classifier_gore
-    
-    # 1. Load NSFW Model (Porn/Hentai vs Neutral/Sexy)
-    if classifier_nsfw is None:
-        logger.info("Loading NSFW model...")
+def load_model():
+    """Load Hugging Face model"""
+    global classifier
+    if classifier is None:
+        logger.info("Loading model...")
         try:
             from transformers import pipeline
-            classifier_nsfw = pipeline("image-classification", model="LukeJacob2023/nsfw-image-detector")
-            logger.info("✅ NSFW Model loaded")
+            # Using LukeJacob2023/nsfw-image-detection for granular classes:
+            # drawings, hentai, neutral, porn, sexy
+            classifier = pipeline("image-classification", model="LukeJacob2023/nsfw-image-detector")
+            logger.info("✅ Model loaded")
         except Exception as e:
-            logger.error(f"Failed to load NSFW model: {e}")
+            logger.error(f"Failed to load model: {e}")
             raise
-
-    # 2. Load Gore/Violence Model
-    if classifier_gore is None:
-        logger.info("Loading Gore model...")
-        try:
-            from transformers import pipeline
-            # Using jaranohaal/vit-base-violence-detection for violence/gore
-            classifier_gore = pipeline("image-classification", model="jaranohaal/vit-base-violence-detection")
-            logger.info("✅ Gore Model loaded")
-        except Exception as e:
-            logger.error(f"Failed to load Gore model: {e}")
-            # Don't raise here, allow running with just NSFW if Gore fails? 
-            # Better to fail so we know it's broken.
-            raise
-            
-    return classifier_nsfw, classifier_gore
+    return classifier
 
 class URLRequest(BaseModel):
     urls: List[str]
@@ -54,10 +47,7 @@ class URLRequest(BaseModel):
 def home():
     return {
         "status": "running",
-        "models": [
-            "LukeJacob2023/nsfw-image-detector",
-            "jaranohaal/vit-base-violence-detection"
-        ]
+        "model": "LukeJacob2023/nsfw-image-detector"
     }
 
 @app.get("/health")
@@ -68,9 +58,9 @@ def health():
 async def scan(request: URLRequest):
     logger.info(f"Scanning {len(request.urls)} images")
     
-    # Load models if not loaded
+    # Load model if not loaded
     try:
-        model_nsfw, model_gore = load_models()
+        model = load_model()
     except:
         return [{"url": u, "is_nsfw": False, "confidence_percentage": 0} for u in request.urls]
     
@@ -94,17 +84,19 @@ async def scan(request: URLRequest):
             # CRITICAL OPTIMIZATION: Resize to 224x224 (Model's native input)
             img = img.resize((224, 224))
             
-            # --- PREDICTION 1: NSFW (Porn/Hentai) ---
-            preds_nsfw = model_nsfw(img)
+            # Predict
+            preds = model(img)
             
+            # Calculate NSFW score based on specific classes
+            # Classes: drawings, hentai, neutral, porn, sexy
+            # We only want to flag 'porn' and 'hentai'. 'sexy' is usually bikini/lingerie.
             nsfw_score = 0
             detailed_detections = []
             
-            for p in preds_nsfw:
+            for p in preds:
                 label = p['label'].lower()
                 score_pct = p['score'] * 100
                 
-                # Only aggregate Porn and Hentai. Ignore 'sexy', 'neutral', 'drawings'
                 if label in ['porn', 'hentai']:
                     nsfw_score += score_pct
                 
@@ -112,44 +104,16 @@ async def scan(request: URLRequest):
                     "class": label,
                     "confidence": score_pct
                 })
-
-            # --- PREDICTION 2: GORE (Violence) ---
-            preds_gore = model_gore(img)
-            gore_score = 0
             
-            for p in preds_gore:
-                label = p['label'].lower()
-                score_pct = p['score'] * 100
-                
-                # Labels usually 'violence' vs 'non_violence' or 'violent'
-                if 'violence' in label or 'violent' in label:
-                    if 'non' not in label: # Exclude 'non_violence'
-                        gore_score = score_pct
-                        detailed_detections.append({
-                            "class": "gore",
-                            "confidence": score_pct
-                        })
+            # Default threshold is 5% in API, but server config usually overrides this
+            is_nsfw = nsfw_score > 5
             
-            # --- FINAL DECISION ---
-            # Max score determines the "confidence" we report
-            final_score = max(nsfw_score, gore_score)
-            
-            # Default threshold check
-            is_nsfw = final_score > 5
-            
-            status_emoji = "✅ Safe"
-            if is_nsfw:
-                if gore_score > nsfw_score:
-                    status_emoji = "🩸 GORE"
-                else:
-                    status_emoji = "🔞 NSFW"
-            
-            logger.info(f"Result: {status_emoji} - Max Score: {final_score:.1f}%")
+            logger.info(f"Result: {'🚨 NSFW' if is_nsfw else '✅ Safe'} - {nsfw_score:.1f}%")
             
             results.append({
                 "url": url,
                 "is_nsfw": is_nsfw,
-                "confidence_percentage": round(final_score, 2),
+                "confidence_percentage": round(nsfw_score, 2),
                 "detections": detailed_detections if is_nsfw else []
             })
             
@@ -162,7 +126,7 @@ async def scan(request: URLRequest):
 if __name__ == "__main__":
     # Pre-load model on startup to prevent first-request lag
     try:
-        load_models()
+        load_model()
     except Exception as e:
         logger.warning(f"Could not pre-load model: {e}")
 
