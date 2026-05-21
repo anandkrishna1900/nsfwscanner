@@ -252,6 +252,34 @@ async def scan_attachment(
 
         logger.info("[Pipeline] Processing %d frame(s) from %s", len(frames), attachment_url)
 
+        # ── Hash cache check (first frame only) ─────────────────────────────────────
+        from utils.hash_cache import compute_phash, get_cached_verdict, store_cached_verdict
+        _first_frame_phash = ""
+        if frames:
+            _first_frame_phash = await asyncio.to_thread(compute_phash, frames[0])
+            if _first_frame_phash and not bypass_prefilter:
+                cached = await get_cached_verdict(_first_frame_phash, config.sqlite_db_path)
+                if cached:
+                    elapsed = (time.monotonic() - start_time) * 1000
+                    logger.info(
+                        "[Pipeline] ⚡ Cache HIT — verdict=%s branch=%s (%.0fms)",
+                        cached["verdict"], cached["branch"], elapsed,
+                    )
+                    return ScanResult(
+                        verdict=cached["verdict"],
+                        reason=f"[Cache HIT] {cached['reason']}",
+                        branch=cached["branch"] or "cache",
+                        model=cached["model"] or "phash_cache",
+                        frame_index=None,
+                        processing_time_ms=elapsed,
+                        pipeline_steps=[
+                            f"Cache Lookup:\n"
+                            f"  Status: HIT\n"
+                            f"  pHash: {_first_frame_phash}\n"
+                            f"  Cached Verdict: {cached['verdict']}"
+                        ],
+                    )
+
         # ── Per-frame scan ────────────────────────────────────────────────────
         best_result: Optional[ScanResult] = None
 
@@ -465,9 +493,25 @@ async def scan_attachment(
             best_result.model,
             elapsed,
         )
+
+        # Store result in hash cache for future fast-path
+        if _first_frame_phash and not bypass_prefilter:
+            await store_cached_verdict(
+                phash_hex=_first_frame_phash,
+                verdict=best_result.verdict,
+                reason=best_result.reason,
+                branch=best_result.branch,
+                model=best_result.model,
+                db_path=config.sqlite_db_path,
+            )
+
         return best_result
 
     finally:
+        # Clear frames if they exist to release memory immediately
+        if "frames" in locals() and isinstance(frames, list):
+            frames.clear()
+
         # Always clean up temp file
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -475,6 +519,21 @@ async def scan_attachment(
                 logger.debug("[Pipeline] Temp file deleted: %s", tmp_path)
             except Exception as e:
                 logger.warning("[Pipeline] Failed to delete temp file %s: %s", tmp_path, e)
+
+        # Aggressive memory cleanup in a background thread to prevent event loop blocking
+        def _aggressive_cleanup():
+            import gc
+            import sys
+            gc.collect()
+            try:
+                if "torch" in sys.modules:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        await asyncio.to_thread(_aggressive_cleanup)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

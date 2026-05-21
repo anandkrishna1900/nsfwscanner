@@ -179,6 +179,9 @@ class AutoMod(commands.Cog):
         self.bot = bot
         self.config_file = "automod_config.json"
         self._guild_locks: dict[int, asyncio.Lock] = {}
+        # Rate limiting: track active scans per user to prevent GPU/CPU flooding
+        self._user_scan_counts: dict[int, int] = {}
+        self._user_rate_lock: asyncio.Lock = asyncio.Lock()
         self.load_config()
         logger.info("🤖 AutoMod initialized with local AI pipeline")
 
@@ -288,7 +291,8 @@ class AutoMod(commands.Cog):
                     if self._is_discord_cdn_url(candidate) and not self._discord_url_has_auth(candidate):
                         continue
                     embed_proxy_lookup[clean_key] = candidate
-                    results.append((candidate, "embed_image", 0))
+                    fname = "embed_gif" if (embed.type == "gifv" or "tenor.com" in candidate or "giphy.com" in candidate) else "embed_image"
+                    results.append((candidate, fname, 0))
                     break  # stop at first usable candidate
 
         # ── 3. URLs found in message text ──────────────────────────────────────
@@ -426,11 +430,12 @@ class AutoMod(commands.Cog):
         }
         color = _COLOR_MAP.get(scan_result.verdict, 0xFF4444)
 
-        title = (
-            "🚨 NSFW Content Detected — BLOCKED"
-            if verdict == "BLOCK"
-            else "⚠️ [REVIEW NEEDED] Possible NSFW Content"
-        )
+        if verdict == "BLOCK":
+            title = "🚨 NSFW Content Detected — BLOCKED"
+        elif verdict == "REVIEW":
+            title = "⚠️ [REVIEW NEEDED] Possible NSFW Content"
+        else:
+            title = "✅ Content Approved — SAFE"
 
         embed = discord.Embed(title=title, color=color, timestamp=now)
         embed.set_thumbnail(url=member.display_avatar.url)
@@ -528,7 +533,8 @@ class AutoMod(commands.Cog):
 
         if file_info:
             lines = []
-            for url, fname, size in file_info[:5]:
+            for item in file_info[:5]:
+                url, fname, size = item[0], item[1], item[2]
                 size_str = f" `({size:,} bytes)`" if size else ""
                 lines.append(f"[{fname}]({url}){size_str}")
             embed.add_field(name="📎 Attachments", value=_trim_embed_value("\n".join(lines)), inline=False)
@@ -626,24 +632,45 @@ class AutoMod(commands.Cog):
 
         # Send image preview as spoiler
         if file_info:
-            try:
-                first_url, first_fname, _ = file_info[0]
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(first_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            data = await resp.read()
-                            preview_file = discord.File(
-                                fp=BytesIO(data),
-                                filename=f"SPOILER_{first_fname}",
+            for item in file_info[:5]:
+                url, fname, size, res = item[0], item[1], item[2], item[3]
+                is_flagged = res.verdict in ("BLOCK", "REVIEW", "NSFW", "EXPLICIT", "SUGGESTIVE")
+                if verdict == "SAFE" or is_flagged:
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                if resp.status == 200:
+                                    data = await resp.read()
+                                    safe_fname = fname if fname.upper().startswith("SPOILER_") else f"SPOILER_{fname}"
+                                    preview_file = discord.File(
+                                        fp=BytesIO(data),
+                                        filename=safe_fname,
+                                        spoiler=True,
+                                    )
+                                    preview_embed = discord.Embed(
+                                        description="⚠️ **Scanned Media Preview** (Click to reveal)" if verdict == "SAFE" else "⚠️ **Flagged Content Preview** (Click to reveal)",
+                                        color=0x22C55E if verdict == "SAFE" else 0xFF0000,
+                                    )
+                                    await log_channel.send(embed=preview_embed, file=preview_file)
+                                else:
+                                    raise IOError(f"HTTP Status {resp.status}")
+                    except Exception as e:
+                        logger.warning("Could not download image preview for %s, sending placeholder: %s", fname, e)
+                        try:
+                            from utils.image_utils import generate_placeholder_image
+                            placeholder_bytes = generate_placeholder_image()
+                            placeholder_file = discord.File(
+                                fp=BytesIO(placeholder_bytes),
+                                filename=f"SPOILER_preview_unavailable_{fname}.png",
                                 spoiler=True,
                             )
                             preview_embed = discord.Embed(
-                                description="⚠️ **Flagged Content Preview** (Click to reveal)",
+                                description="⚠️ **Flagged Content Preview** (Download Failed)",
                                 color=0xFF0000,
                             )
-                            await log_channel.send(embed=preview_embed, file=preview_file)
-            except Exception as e:
-                logger.debug("Could not send image preview: %s", e)
+                            await log_channel.send(embed=preview_embed, file=placeholder_file)
+                        except Exception as placeholder_err:
+                            logger.error("Failed to send placeholder image: %s", placeholder_err)
 
     async def _send_debug_log_embed(
         self,
@@ -663,9 +690,19 @@ class AutoMod(commands.Cog):
             if not debug_channel:
                 try:
                     debug_channel = await self.bot.fetch_channel(debug_channel_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "⚠️ Configured DEBUG_LOG_CHANNEL_ID %s could not be fetched: %s. "
+                        "Please verify that the ID is correct and the bot has permission to view and send messages in it.",
+                        debug_channel_id,
+                        e,
+                    )
             if not debug_channel:
+                logger.warning(
+                    "⚠️ Configured DEBUG_LOG_CHANNEL_ID %s was not found in cache or fetched. "
+                    "Debugging scans will not be logged to Discord.",
+                    debug_channel_id,
+                )
                 return
 
             member = message.author
@@ -754,46 +791,9 @@ class AutoMod(commands.Cog):
             embed.add_field(name="📎 Media Info", value=media_info_value, inline=False)
 
             # Image preview — spoilered for any non-SAFE verdict
-            preview_file = None
-            if _is_image:
-                if not is_nsfw_verdict:
-                    # Safe content: show inline in the embed
-                    embed.set_image(url=url)
-                else:
-                    # Non-safe: download and attach as spoiler
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                                if resp.status == 200:
-                                    data = await resp.read()
-                                    # Derive a real filename from the URL if fname is generic
-                                    base_fname = fname
-                                    if not any(fname.lower().endswith(e) for e in _img_exts):
-                                        try:
-                                            base_fname = _url_path.split("/")[-1] or fname
-                                        except Exception:
-                                            pass
-                                    safe_fname = (
-                                        base_fname if base_fname.upper().startswith("SPOILER_")
-                                        else f"SPOILER_{base_fname}"
-                                    )
-                                    preview_file = discord.File(
-                                        fp=BytesIO(data),
-                                        filename=safe_fname,
-                                        spoiler=True,
-                                    )
-                                    embed.set_image(url=f"attachment://{safe_fname}")
-                    except Exception as e:
-                        logger.debug("Could not download debug image for spoiler: %s", e)
-                        # Do NOT fall back to showing the raw URL — leave image blank
-
-            elif _is_video and is_nsfw_verdict:
-                # Videos can't be spoilered via Discord embeds; note it in the field
-                embed.add_field(
-                    name="🎬 Video Preview",
-                    value="⚠️ *Video hidden — non-SAFE verdict. Check the original channel.*",
-                    inline=False,
-                )
+            if not is_nsfw_verdict and _is_image:
+                # Safe content: show inline in the embed
+                embed.set_image(url=url)
 
             # ── Build feedback buttons view ───────────────────────────────────
             try:
@@ -818,10 +818,57 @@ class AutoMod(commands.Cog):
             )
 
             embed.set_footer(text="NSFW Bot Debugging Logger • Local Inference | Use buttons below to submit feedback")
-            if preview_file:
-                await debug_channel.send(embed=embed, file=preview_file, view=feedback_view)
-            else:
-                await debug_channel.send(embed=embed, view=feedback_view)
+            
+            # Always send the main debug embed cleanly without attachments
+            await debug_channel.send(embed=embed, view=feedback_view)
+
+            # Send the preview as a separate message for non-SAFE verdicts to ensure reliable spoilering/censoring
+            if is_nsfw_verdict:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                # Derive a real filename from the URL if fname is generic
+                                base_fname = fname
+                                if not any(fname.lower().endswith(e) for e in _img_exts + _vid_exts):
+                                    try:
+                                        base_fname = _url_path.split("/")[-1] or fname
+                                    except Exception:
+                                        pass
+                                safe_fname = (
+                                    base_fname if base_fname.upper().startswith("SPOILER_")
+                                    else f"SPOILER_{base_fname}"
+                                )
+                                preview_file = discord.File(
+                                    fp=BytesIO(data),
+                                    filename=safe_fname,
+                                    spoiler=True,
+                                )
+                                preview_embed = discord.Embed(
+                                    description="⚠️ **Flagged Content Preview** (Click to reveal)",
+                                    color=0xFF0000,
+                                )
+                                await debug_channel.send(embed=preview_embed, file=preview_file)
+                            else:
+                                raise IOError(f"HTTP Status {resp.status}")
+                except Exception as e:
+                    logger.warning("Could not download debug image/video for spoiler, sending placeholder: %s", e)
+                    try:
+                        from utils.image_utils import generate_placeholder_image
+                        placeholder_bytes = generate_placeholder_image()
+                        placeholder_file = discord.File(
+                            fp=BytesIO(placeholder_bytes),
+                            filename=f"SPOILER_preview_unavailable_{fname}.png",
+                            spoiler=True,
+                        )
+                        preview_embed = discord.Embed(
+                            description="⚠️ **Flagged Content Preview** (Download Failed)",
+                            color=0xFF0000,
+                        )
+                        await debug_channel.send(embed=preview_embed, file=placeholder_file)
+                    except Exception as placeholder_err:
+                        logger.error("Failed to send debug placeholder image: %s", placeholder_err)
         except Exception as e:
             logger.error("Failed to send debug log embed: %s", e, exc_info=True)
 
@@ -865,79 +912,164 @@ class AutoMod(commands.Cog):
                 message.channel.name,
             )
 
-            # Per-guild lock to prevent concurrent GPU inference
-            async with self._guild_lock(message.guild.id):
-                from moderation.pipeline import scan_attachment
-
-                best_result = None
-                best_file_info = None
-
-                for url, fname, size in media_list:
-                    try:
-                        result = await scan_attachment(url, bot_config)
-                    except IOError as e:
-                        # Download failed (404, 403, timeout, etc.) — skip silently
-                        logger.warning("⏭️ Skipping undownloadable URL [%s]: %s", fname, e)
-                        continue
-                    except Exception as e:
-                        logger.error("Pipeline error for %s: %s", url, e, exc_info=True)
-                        continue
-
-                    logger.info(
-                        "🔍 [%s] %s → %s (%s)",
-                        message.author.name,
-                        fname,
-                        result.verdict,
-                        result.reason,
+            # ── Per-user rate limiting ────────────────────────────────────────
+            MAX_CONCURRENT_SCANS = 3
+            uid = message.author.id
+            async with self._user_rate_lock:
+                active = self._user_scan_counts.get(uid, 0)
+                if active >= MAX_CONCURRENT_SCANS:
+                    # Too many concurrent scans from this user — reject
+                    logger.warning(
+                        "🚫 Rate limit hit for %s (%d active scans)", message.author, active
                     )
-
-                    # Send to debug channel if configured, even if SAFE
-                    if bot_config.debug_log_channel_id:
-                        await self._send_debug_log_embed(message, result, url, fname, size)
-
-                    if best_result is None or _SEVERITY.get(result.verdict, 0) > _SEVERITY.get(best_result.verdict, 0):
-                        best_result = result
-                        best_file_info = [(url, fname, size)]
-
-                    if result.verdict in _BLOCKING_VERDICTS:
-                        break  # Stop processing on first block
-
-                if best_result is None or best_result.verdict == "SAFE":
-                    return
-
-                # Take action based on verdict
-                file_info = best_file_info or []
-
-                if best_result.verdict in _BLOCKING_VERDICTS:
-                    # Delete message
                     try:
                         await message.delete()
-                        logger.info("🗑️ Deleted message from %s", message.author)
-                    except Exception as e:
-                        logger.warning("Could not delete message: %s", e)
-
-                    # DM user
-                    await self._send_dm(message.author, message.guild.name)
-
-                    # Punish
+                    except Exception:
+                        pass
                     try:
-                        member = message.guild.get_member(message.author.id)
-                        if member:
-                            await self._punish_user(member, best_result.reason, cfg)
-                    except Exception as e:
-                        logger.error("Punishment error: %s", e)
+                        await message.author.send(
+                            f"⚠️ **Rate Limit Exceeded:** You have too many concurrent media scans in progress. "
+                            f"Please wait a few seconds before uploading more media."
+                        )
+                    except Exception:
+                        pass
+                    return
 
-                    # Log
-                    await self._send_log_embed(message, best_result, file_info, "BLOCK", cfg)
+            async with self._user_rate_lock:
+                self._user_scan_counts[uid] = self._user_scan_counts.get(uid, 0) + 1
 
-                elif best_result.verdict in _REVIEW_VERDICTS:
-                    # Do NOT delete — just log for human review
-                    await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
-                    logger.info(
-                        "⚠️ REVIEW flagged for %s in #%s",
-                        message.author,
-                        message.channel.name,
-                    )
+            try:
+                # Per-guild lock to prevent concurrent GPU inference
+                async with self._guild_lock(message.guild.id):
+                    from moderation.pipeline import scan_attachment
+                    from utils.database import record_scan
+
+                    best_result = None
+                    scanned_files = []
+
+                    for url, fname, size in media_list[:5]:
+                        try:
+                            result = await scan_attachment(url, bot_config)
+                        except IOError as e:
+                            # Download failed (404, 403, timeout, etc.) — skip silently
+                            logger.warning("⏭️ Skipping undownloadable URL [%s]: %s", fname, e)
+                            continue
+                        except Exception as e:
+                            logger.error("Pipeline error for %s: %s", url, e, exc_info=True)
+                            continue
+
+                        logger.info(
+                            "🔍 [%s] %s → %s (%s)",
+                            message.author.name,
+                            fname,
+                            result.verdict,
+                            result.reason,
+                        )
+
+                        # Send to debug channel if configured, even if SAFE
+                        if bot_config.debug_log_channel_id:
+                            await self._send_debug_log_embed(message, result, url, fname, size)
+
+                        # Record scan in database
+                        cache_hit = result.reason and result.reason.startswith("[Cache HIT]")
+                        await record_scan(
+                            message_id=str(message.id),
+                            guild_id=str(message.guild.id),
+                            channel_id=str(message.channel.id),
+                            user_id=str(message.author.id),
+                            filename=fname,
+                            verdict=result.verdict,
+                            branch=result.branch,
+                            model=result.model,
+                            reason=result.reason,
+                            processing_time_ms=result.processing_time_ms,
+                            cache_hit=cache_hit,
+                        )
+
+                        scanned_files.append((url, fname, size, result))
+
+                        if best_result is None or _SEVERITY.get(result.verdict, 0) > _SEVERITY.get(best_result.verdict, 0):
+                            best_result = result
+
+                    if best_result is None:
+                        return
+
+                    # Take action based on verdict
+                    file_info = scanned_files
+
+                    if best_result.verdict in _BLOCKING_VERDICTS:
+                        # Delete message
+                        try:
+                            await message.delete()
+                            logger.info("🗑️ Deleted message from %s", message.author)
+                        except Exception as e:
+                            logger.warning("Could not delete message: %s", e)
+
+                        # DM user
+                        await self._send_dm(message.author, message.guild.name)
+
+                        # Punish
+                        try:
+                            member = message.guild.get_member(message.author.id)
+                            if member:
+                                await self._punish_user(member, best_result.reason, cfg)
+                        except Exception as e:
+                            logger.error("Punishment error: %s", e)
+
+                        # Log
+                        await self._send_log_embed(message, best_result, file_info, "BLOCK", cfg)
+
+                    elif best_result.verdict in _REVIEW_VERDICTS:
+                        # Do NOT delete — just log for human review
+                        await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
+                        logger.info(
+                            "⚠️ REVIEW flagged for %s in #%s",
+                            message.author,
+                            message.channel.name,
+                        )
+
+                    elif best_result.verdict == "SAFE":
+                        # Log safe content so moderators can submit feedback (e.g. False Negatives)
+                        # ONLY log static images, NOT GIFs or videos!
+                        is_static_image = True
+                        gif_vid_exts = (".gif", ".gifv", ".mp4", ".webm", ".mov", ".avi")
+                        
+                        # Check if any media item in the entire message is a GIF or video
+                        has_gif_or_video = False
+                        for m_url, m_fname, _ in media_list:
+                            m_name_lower = m_fname.lower()
+                            m_url_lower = m_url.split("?")[0].lower()
+                            if (
+                                any(ext in m_name_lower for ext in gif_vid_exts)
+                                or any(ext in m_url_lower for ext in gif_vid_exts)
+                                or "tenor.com" in m_url_lower
+                                or "giphy.com" in m_url_lower
+                                or "tenor.com" in m_name_lower
+                                or "giphy.com" in m_name_lower
+                                or m_name_lower == "embed_gif"
+                            ):
+                                has_gif_or_video = True
+                                break
+                                
+                        if has_gif_or_video or any(emb.type == "gifv" for emb in message.embeds):
+                            is_static_image = False
+
+                        if is_static_image:
+                            await self._send_log_embed(message, best_result, file_info, "SAFE", cfg)
+                            logger.info(
+                                "✅ SAFE static image logged for %s in #%s",
+                                message.author,
+                                message.channel.name,
+                            )
+                        else:
+                            logger.info(
+                                "✅ SAFE GIF/video skipped from main moderation log (only logged to debug log) for %s in #%s",
+                                message.author,
+                                message.channel.name,
+                            )
+            finally:
+                async with self._user_rate_lock:
+                    self._user_scan_counts[uid] = max(0, self._user_scan_counts.get(uid, 1) - 1)
 
         except Exception as e:
             logger.error("AutoMod on_message error: %s", e, exc_info=True)

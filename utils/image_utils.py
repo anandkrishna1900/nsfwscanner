@@ -151,3 +151,57 @@ def prepare_image_for_onnx(
 
     # 8. Add batch dimension
     return np.expand_dims(arr, axis=0).copy()
+
+
+def generate_placeholder_image() -> bytes:
+    """
+    Generate a highly polished, premium-looking 300x150 dark-mode placeholder image
+    with a vibrant red warning header accent and bold text indicating that the preview
+    is unavailable due to flagged NSFW content.
+    """
+    import io
+    from PIL import ImageDraw, ImageFont
+
+    width, height = 300, 150
+    # Create dark slate canvas
+    img = Image.new("RGB", (width, height), color=(26, 27, 38)) # Rich Slate Dark
+    draw = ImageDraw.Draw(img)
+    
+    # Draw a 5px high warning red bar at the top
+    draw.rectangle([0, 0, width, 5], fill=(239, 68, 68))
+    
+    text_line1 = "⚠️ PREVIEW UNAVAILABLE"
+    text_line2 = "[ FLAGGED NSFW ]"
+    
+    # Attempt to load Arial or clean font
+    try:
+        font_title = ImageFont.truetype("arial.ttf", 14)
+        font_sub = ImageFont.truetype("arial.ttf", 11)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
+        
+    try:
+        bbox1 = draw.textbbox((0, 0), text_line1, font=font_title)
+        w1, h1 = bbox1[2] - bbox1[0], bbox1[3] - bbox1[1]
+        bbox2 = draw.textbbox((0, 0), text_line2, font=font_sub)
+        w2, h2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
+    except AttributeError:
+        w1, h1 = draw.textsize(text_line1, font=font_title)
+        w2, h2 = draw.textsize(text_line2, font=font_sub)
+        
+    x1 = (width - w1) // 2
+    y1 = (height - h1 - h2 - 12) // 2
+    
+    x2 = (width - w2) // 2
+    y2 = y1 + h1 + 12
+    
+    # White text for warning header
+    draw.text((x1, y1), text_line1, fill=(255, 255, 255), font=font_title)
+    # Vibrant red text for the subtext
+    draw.text((x2, y2), text_line2, fill=(239, 68, 68), font=font_sub)
+    
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+

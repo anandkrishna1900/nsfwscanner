@@ -34,6 +34,9 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".webm", ".mkv", ".flv"}
 _VIDEO_MAX_SECS: int   = 30   # never scan past this timestamp
 _VIDEO_FRAME_INTERVAL: float = 3.0   # one frame every 3 seconds → max 10 frames
 
+# GIF scanning cap — evenly spaced frames; short GIFs (<= cap) are fully scanned
+MAX_GIF_FRAMES: int = 15
+
 
 # ── Custom exceptions ─────────────────────────────────────────────────────────
 
@@ -122,21 +125,53 @@ def _extract_image(file_path: str) -> List[Image.Image]:
 
 def _extract_gif(file_path: str) -> List[Image.Image]:
     """
-    Extract ALL frames from a GIF.
+    Extract frames from a GIF using smart sampling.
 
-    GIFs are short by design (typically < 50 frames), so a full scan
-    is both fast and the correct behaviour.
+    - If the GIF has <= MAX_GIF_FRAMES frames: extract all of them.
+    - If the GIF has > MAX_GIF_FRAMES frames: pick MAX_GIF_FRAMES evenly
+      spaced frame indices and only decode those.
+
+    This bounds the per-GIF cost regardless of length while still catching
+    any explicit frame hidden anywhere in the animation.
     """
     try:
         import imageio.v3 as iio
         import numpy as np
 
+        # First pass: count total frames cheaply via metadata
+        try:
+            props = iio.improps(file_path, plugin="pillow")
+            total_frames: int = props.n_images if props.n_images and props.n_images > 0 else 0
+        except Exception:
+            total_frames = 0
+
+        # Build the set of frame indices we want to decode
+        if total_frames > 0 and total_frames > MAX_GIF_FRAMES:
+            step = total_frames / MAX_GIF_FRAMES
+            wanted: set[int] = {int(i * step) for i in range(MAX_GIF_FRAMES)}
+            wanted.add(total_frames - 1)  # always include last frame
+            sample_mode = True
+            logger.debug(
+                "GIF: %d total frames → sampling %d evenly spaced from %s",
+                total_frames, len(wanted), file_path,
+            )
+        else:
+            wanted = set()   # empty = take all
+            sample_mode = False
+
         frames: List[Image.Image] = []
-        for frame_array in iio.imiter(file_path, plugin="pillow"):
+        for idx, frame_array in enumerate(iio.imiter(file_path, plugin="pillow")):
+            if sample_mode and idx not in wanted:
+                continue
             img = Image.fromarray(frame_array.astype("uint8"))
             frames.append(_to_rgb(img))
 
-        logger.debug("GIF: extracted %d frame(s) from %s", len(frames), file_path)
+        logger.debug(
+            "GIF: extracted %d frame(s) from %s%s",
+            len(frames),
+            file_path,
+            f" (sampled from {total_frames})" if sample_mode else "",
+        )
         return frames
 
     except Exception as e:

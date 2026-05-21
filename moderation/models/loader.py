@@ -97,7 +97,7 @@ class ModelLoader:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 logger.debug("CUDA cache cleared")
-        except ImportError:
+        except Exception:
             pass
 
     # ── Public API ────────────────────────────────────────────────────────────

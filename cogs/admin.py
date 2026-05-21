@@ -399,6 +399,163 @@ class NSFWAdminCog(commands.Cog):
             await interaction.followup.send(f"❌ Error fetching stats: {e}", ephemeral=True)
 
 
+    # ── /nsfw stats ───────────────────────────────────────────────────────────
+
+    @nsfw_group.command(
+        name="stats",
+        description="Show overall scan volume, verdict breakdown, and model accuracy",
+    )
+    @_has_manage_messages()
+    async def nsfw_stats(self, interaction: discord.Interaction) -> None:
+        """Display combined scan stats and feedback accuracy for this guild."""
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            from utils.database import get_scan_stats, get_feedback_stats
+            from utils.hash_cache import _DB_PATH as _hc_db
+
+            guild_id = str(interaction.guild_id)
+            scan_stats = await get_scan_stats(guild_id)
+            fb_stats = await get_feedback_stats(guild_id)
+
+            total = scan_stats["total_scans"]
+
+            embed = discord.Embed(
+                title="📊 NSFW Scanner — Full Statistics",
+                color=0x6366F1,
+                timestamp=discord.utils.utcnow(),
+            )
+
+            # ── Scan volume ───────────────────────────────────────────────
+            if total == 0:
+                embed.description = (
+                    "No scans have been logged yet for this server.\n"
+                    "Stats populate automatically as media is posted in monitored channels."
+                )
+                embed.set_footer(text="NSFW Bot Analytics")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            cache_pct = round(scan_stats["cache_hits"] / total * 100, 1) if total else 0.0
+            embed.add_field(
+                name="📈 Scan Volume",
+                value=(
+                    f"**Total Scans:** `{total:,}`\n"
+                    f"**🚨 Blocked:** `{scan_stats['blocked']:,}`\n"
+                    f"**⚠️ Reviewed:** `{scan_stats['reviewed']:,}`\n"
+                    f"**✅ Safe:** `{scan_stats['safe']:,}`\n"
+                    f"**⚡ Cache Hits:** `{scan_stats['cache_hits']:,}` (`{cache_pct}%`)"
+                ),
+                inline=True,
+            )
+
+            # ── Verdict breakdown ─────────────────────────────────────────
+            bd = scan_stats["verdict_breakdown"]
+            bd_lines = "\n".join(
+                f"`{v}`: **{c:,}**" for v, c in sorted(bd.items(), key=lambda x: -x[1])
+            )
+            embed.add_field(
+                name="🗂️ Verdict Breakdown",
+                value=bd_lines or "No data",
+                inline=True,
+            )
+
+            # ── Performance ───────────────────────────────────────────────
+            embed.add_field(
+                name="⏱️ Avg Processing Time",
+                value=f"`{scan_stats['avg_processing_ms']:.0f} ms` per scan",
+                inline=True,
+            )
+
+            # ── Feedback accuracy (if any) ────────────────────────────────
+            fb_total = fb_stats["total_logged"]
+            if fb_total > 0:
+                accuracy = fb_stats["accuracy"]
+                color_bar = "🟩" * int(accuracy / 10) + "⬜" * (10 - int(accuracy / 10))
+                embed.add_field(
+                    name="🎯 Moderator-Verified Accuracy",
+                    value=(
+                        f"{color_bar}\n"
+                        f"`{accuracy}%` on {fb_total} reviewed cases\n"
+                        f"FP rate: `{fb_stats['fp_rate']}%` • FN rate: `{fb_stats['fn_rate']}%`"
+                    ),
+                    inline=False,
+                )
+
+                top_tags = fb_stats.get("top_failed_tags", [])
+                if top_tags:
+                    tag_lines = [f"`{tag}` — {count} misses" for tag, count in top_tags[:6]]
+                    embed.add_field(
+                        name="🔍 Top Misidentified Tags",
+                        value="\n".join(tag_lines),
+                        inline=False,
+                    )
+            else:
+                embed.add_field(
+                    name="🎯 Moderator Feedback",
+                    value=(
+                        "No feedback submitted yet.\n"
+                        "Use the **✅ / ❌ / ⚠️** buttons on log embeds to track accuracy."
+                    ),
+                    inline=False,
+                )
+
+            embed.set_footer(text="NSFW Bot Analytics • /nsfw export to download raw CSV")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error("nsfw stats error: %s", e, exc_info=True)
+            await interaction.followup.send(f"❌ Error fetching stats: {e}", ephemeral=True)
+
+    # ── /nsfw export ──────────────────────────────────────────────────────────
+
+    @nsfw_group.command(
+        name="export",
+        description="Download all moderator feedback data as a CSV file",
+    )
+    @_has_manage_messages()
+    async def nsfw_export(self, interaction: discord.Interaction) -> None:
+        """Export moderation_feedback table for this guild as a .csv attachment."""
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            from utils.database import export_feedback_csv
+            import io
+
+            guild_id = str(interaction.guild_id)
+            csv_text = await export_feedback_csv(guild_id)
+
+            if not csv_text.strip() or csv_text.count("\n") <= 1:
+                await interaction.followup.send(
+                    "ℹ️ No feedback data has been recorded for this server yet.",
+                    ephemeral=True,
+                )
+                return
+
+            row_count = csv_text.count("\n") - 1  # subtract header row
+            csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
+            filename = f"nsfw_feedback_{interaction.guild_id}.csv"
+            file = discord.File(fp=csv_bytes, filename=filename)
+
+            embed = discord.Embed(
+                title="📥 Feedback Export Ready",
+                description=(
+                    f"Exported **{row_count:,}** feedback record(s) for this server.\n"
+                    "Columns: `id`, `message_id`, `user_id`, `moderator_id`, "
+                    "`predicted_verdict`, `moderator_verdict`, `branch`, `model`, "
+                    "`processing_time_ms`, `detected_tags`, `created_at`"
+                ),
+                color=0x22C55E,
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_footer(text="Use this data to calibrate future ML model improvements")
+            await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+
+        except Exception as e:
+            logger.error("nsfw export error: %s", e, exc_info=True)
+            await interaction.followup.send(f"❌ Export failed: {e}", ephemeral=True)
+
+
 async def setup(bot: commands.Bot) -> None:
     cog = NSFWAdminCog(bot)
     await bot.add_cog(cog)

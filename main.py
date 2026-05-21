@@ -10,13 +10,19 @@ import os
 os.environ["HF_HUB_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
+# Eagerly import torch at startup to prevent dll loading blocking the asyncio event loop thread later
+try:
+    import torch
+except Exception:
+    pass
+
 import asyncio
 import logging
 import time
 import warnings
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # Suppress HF unauthenticated request warnings
 warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
@@ -139,6 +145,39 @@ async def on_ready() -> None:
         logger.info("👁️  Monitoring channels: %s", config.monitored_channels)
     else:
         logger.info("👁️  No channels pre-configured — use /nsfw enable #channel")
+
+    # Start daily database cleanup
+    if not daily_cleanup.is_running():
+        daily_cleanup.start()
+        logger.info("🧹 Daily cleanup task started (runs every 24h)")
+
+
+# ── Daily database cleanup task ───────────────────────────────────────────────────
+@tasks.loop(hours=24)
+async def daily_cleanup() -> None:
+    """Prune old records from the SQLite database once every 24 hours."""
+    try:
+        from utils.database import cleanup_old_records
+        from config import config
+        deleted = await cleanup_old_records(
+            db_path=config.sqlite_db_path,
+            feedback_days=90,
+            cache_days=30,
+            scan_log_days=60,
+        )
+        logger.info(
+            "🧹 Daily cleanup done — feedback: %d, cache: %d, scan_log: %d rows deleted",
+            deleted["moderation_feedback"],
+            deleted["image_hash_cache"],
+            deleted["scan_log"],
+        )
+    except Exception as e:
+        logger.error("Daily cleanup failed: %s", e)
+
+
+@daily_cleanup.before_loop
+async def before_daily_cleanup() -> None:
+    await bot.wait_until_ready()
 
 
 # ── on_error ──────────────────────────────────────────────────────────────────
