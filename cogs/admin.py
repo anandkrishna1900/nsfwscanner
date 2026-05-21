@@ -244,8 +244,22 @@ class NSFWAdminCog(commands.Cog):
 
             result = await scan_attachment(attachment.url, bot_config, bypass_prefilter=True)
 
-            verdict_emoji = {"BLOCK": "🚨", "REVIEW": "⚠️", "SAFE": "✅"}.get(result.verdict, "❓")
-            color = {"BLOCK": 0xFF4444, "REVIEW": 0xFFA500, "SAFE": 0x22C55E}.get(result.verdict, 0x888888)
+            verdict_emoji = {
+                "EXPLICIT": "🚨",
+                "NSFW": "🚨",
+                "BLOCK": "🚨",
+                "SUGGESTIVE": "⚠️",
+                "REVIEW": "⚠️",
+                "SAFE": "✅",
+            }.get(result.verdict, "❓")
+            color = {
+                "EXPLICIT": 0xDC2626,
+                "NSFW": 0xEF4444,
+                "BLOCK": 0xFF4444,
+                "SUGGESTIVE": 0xFFA500,
+                "REVIEW": 0xFFA500,
+                "SAFE": 0x22C55E,
+            }.get(result.verdict, 0x888888)
 
             embed = discord.Embed(
                 title=f"{verdict_emoji} Scan Result: {result.verdict}",

@@ -2,7 +2,7 @@
 bot/cogs/automod.py — NSFW Moderation cog.
 
 Listens for messages in monitored channels, runs the local AI pipeline,
-and takes action based on the BLOCK / REVIEW / SAFE verdict.
+and takes action based on SAFE / SUGGESTIVE / REVIEW / NSFW / BLOCK / EXPLICIT verdicts.
 
 Per-guild config (punishment, channels, whitelist, log_channel) is stored
 in automod_config.json.
@@ -25,9 +25,98 @@ from config import config as bot_config
 
 logger = logging.getLogger(__name__)
 
+_EMBED_FIELD_LIMIT = 1024
+
 
 # ── Verdict severity helper ────────────────────────────────────────────────────
-_SEVERITY = {"SAFE": 0, "REVIEW": 1, "BLOCK": 2}
+_SEVERITY = {
+    "SAFE": 0,
+    "SUGGESTIVE": 1,
+    "REVIEW": 1,
+    "NSFW": 2,
+    "BLOCK": 2,
+    "EXPLICIT": 3,
+}
+_BLOCKING_VERDICTS = {"BLOCK", "NSFW", "EXPLICIT"}
+_REVIEW_VERDICTS = {"REVIEW", "SUGGESTIVE"}
+
+
+def _trim_embed_value(value: str, limit: int = _EMBED_FIELD_LIMIT) -> str:
+    """Trim a Discord embed field value to the 1024-character hard limit."""
+    if len(value) <= limit:
+        return value
+    suffix = "\n... [truncated]"
+    return value[: max(0, limit - len(suffix))] + suffix
+
+
+def _code_field_value(text: str, lang: str = "") -> str:
+    """Wrap text in a code block while reserving room for Discord's field limit."""
+    open_fence = f"```{lang}\n"
+    close_fence = "\n```"
+    budget = _EMBED_FIELD_LIMIT - len(open_fence) - len(close_fence)
+    return f"{open_fence}{_trim_embed_value(text, budget)}{close_fence}"
+
+
+def _find_trace_value(lines: list[str], label: str) -> Optional[str]:
+    prefix = f"{label}:"
+    for line in lines:
+        clean = line.strip()
+        if clean.startswith(prefix):
+            return clean[len(prefix):].strip()
+    return None
+
+
+def _human_trace_value(pipeline_steps: list[str]) -> str:
+    """Convert verbose model trace strings into a short moderator-readable summary."""
+    sections: list[str] = []
+
+    for step in pipeline_steps:
+        lines = [line.strip() for line in step.splitlines() if line.strip()]
+        if not lines:
+            continue
+
+        title = lines[0].replace("Stage 0: ", "").replace("Stage 1: ", "").replace("Stage 2B: ", "").replace("Stage 2A: ", "").replace("Stage 2: ", "")
+
+        if "Pre-filter" in title:
+            score = _find_trace_value(lines, "NSFW Score") or "unknown"
+            verdict = _find_trace_value(lines, "Verdict") or "unknown"
+            sections.append(f"**Pre-filter:** NSFW score `{score}`. {verdict}.")
+            continue
+
+        if "Gatekeeper" in title:
+            route = _find_trace_value(lines, "Classification") or "unknown"
+            confidence = _find_trace_value(lines, "Confidence") or "unknown"
+            sections.append(f"**Content type:** `{route}` with `{confidence}` confidence.")
+            continue
+
+        if "Anime" in title:
+            wdv3 = _find_trace_value(lines, "- wdv3_explicit") or "0"
+            r18 = _find_trace_value(lines, "- anime_rating_r18") or "0"
+            genital = _find_trace_value(lines, "- genital_score") or "0"
+            breast = _find_trace_value(lines, "- breast_score") or "0"
+            rating = _find_trace_value(lines, "Tagger Rating") or "unknown"
+            verdict = _find_trace_value(lines, "Verdict") or "unknown"
+            sections.append(
+                "**Anime detector:** "
+                f"rating `{rating}`, explicit `{wdv3.split()[0]}`, r18 `{r18.split()[0]}`, "
+                f"genitals `{genital.split()[0]}`, breasts `{breast.split()[0]}`. Verdict: `{verdict}`."
+            )
+            continue
+
+        if "Real/Photo" in title:
+            detections = _find_trace_value(lines, "Detected Explicit Labels") or "see log details"
+            verdict = _find_trace_value(lines, "Verdict") or "unknown"
+            sections.append(f"**Real-photo detector:** {detections}. Verdict: `{verdict}`.")
+            continue
+
+        verdict = _find_trace_value(lines, "Verdict")
+        if verdict:
+            sections.append(f"**{title}:** Verdict `{verdict}`.")
+
+    if not sections:
+        return "No detailed model trace was recorded."
+
+    return _trim_embed_value("\n".join(sections))
 
 
 class RemoveTimeoutView(discord.ui.View):
@@ -241,15 +330,17 @@ class AutoMod(commands.Cog):
         """Send a detailed log embed to the configured log channel."""
         log_channel_id = bot_config.log_channel_id or cfg.get("log_channel")
         if not log_channel_id:
+            logger.warning("NSFW log channel is not configured; cannot send moderation log")
             return
 
         log_channel = message.guild.get_channel(int(log_channel_id))
         if not log_channel:
             try:
                 log_channel = await message.guild.fetch_channel(int(log_channel_id))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Could not fetch NSFW log channel %s: %s", log_channel_id, e)
         if not log_channel:
+            logger.warning("NSFW log channel %s was not found in guild %s", log_channel_id, message.guild.id)
             return
 
         member = message.author
@@ -287,7 +378,7 @@ class AutoMod(commands.Cog):
         # AI detection info
         embed.add_field(
             name="🤖 AI Detection Summary",
-            value=(
+            value=_trim_embed_value(
                 f"**Verdict:** `{scan_result.verdict}`\n"
                 f"**Reason:** {scan_result.reason}\n"
                 f"**Branch:** {scan_result.branch}\n"
@@ -299,19 +390,16 @@ class AutoMod(commands.Cog):
         )
 
         if getattr(scan_result, "pipeline_steps", None):
-            steps_text = "\n\n".join(scan_result.pipeline_steps)
-            if len(steps_text) > 980:
-                steps_text = steps_text[:980] + "\n... [Trace truncated due to character limit]"
             embed.add_field(
-                name="📋 AI Model Council Verification Trace",
-                value=f"```yaml\n{steps_text}\n```",
+                name="📋 Model Decision Summary",
+                value=_human_trace_value(scan_result.pipeline_steps),
                 inline=False,
             )
 
         if message.content:
             embed.add_field(
                 name="💬 Message",
-                value=message.content[:512],
+                value=_trim_embed_value(message.content),
                 inline=False,
             )
 
@@ -320,7 +408,7 @@ class AutoMod(commands.Cog):
             for url, fname, size in file_info[:5]:
                 size_str = f" `({size:,} bytes)`" if size else ""
                 lines.append(f"[{fname}]({url}){size_str}")
-            embed.add_field(name="📎 Attachments", value="\n".join(lines), inline=False)
+            embed.add_field(name="📎 Attachments", value=_trim_embed_value("\n".join(lines)), inline=False)
 
         embed.set_footer(text="NSFW Detection System • Local AI Pipeline")
 
@@ -328,7 +416,24 @@ class AutoMod(commands.Cog):
         if verdict == "BLOCK" and cfg.get("punishment") == "timeout":
             view = RemoveTimeoutView(member.id)
 
-        log_msg = await log_channel.send(embed=embed, view=view)
+        try:
+            log_msg = await log_channel.send(embed=embed, view=view)
+        except discord.HTTPException as e:
+            logger.error("Failed to send rich NSFW log embed; sending compact fallback: %s", e)
+            fallback = discord.Embed(
+                title=title,
+                color=color,
+                timestamp=now,
+                description=_trim_embed_value(
+                    f"**User:** {member.mention} (`{member.id}`)\n"
+                    f"**Channel:** {message.channel.mention}\n"
+                    f"**Verdict:** `{scan_result.verdict}`\n"
+                    f"**Reason:** {scan_result.reason}\n"
+                    f"**Branch:** `{scan_result.branch}`\n"
+                    f"**Model:** `{scan_result.model}`"
+                ),
+            )
+            log_msg = await log_channel.send(embed=fallback)
 
         # Send image preview as spoiler
         if file_info:
@@ -379,16 +484,22 @@ class AutoMod(commands.Cog):
 
             # Choose color based on verdict
             color_map = {
-                "SAFE": 0x22C55E,    # Green
-                "REVIEW": 0xF59E0B,  # Orange
-                "BLOCK": 0xEF4444,   # Red
+                "SAFE": 0x22C55E,
+                "SUGGESTIVE": 0xF59E0B,
+                "REVIEW": 0xF59E0B,
+                "NSFW": 0xEF4444,
+                "BLOCK": 0xEF4444,
+                "EXPLICIT": 0xDC2626,
             }
             color = color_map.get(scan_result.verdict, 0x888888)
 
             verdict_emoji = {
                 "SAFE": "✅ SAFE",
+                "SUGGESTIVE": "⚠️ SUGGESTIVE",
                 "REVIEW": "⚠️ REVIEW NEEDED",
+                "NSFW": "🚨 NSFW",
                 "BLOCK": "🚨 BLOCKED",
+                "EXPLICIT": "🚨 EXPLICIT",
             }.get(scan_result.verdict, "❓ UNKNOWN")
 
             embed = discord.Embed(
@@ -417,17 +528,14 @@ class AutoMod(commands.Cog):
 
             embed.add_field(
                 name="📊 Details & Confidence",
-                value=f"```\n{scan_result.reason}\n```",
+                value=_code_field_value(str(scan_result.reason or "")),
                 inline=False
             )
 
             if getattr(scan_result, "pipeline_steps", None):
-                steps_text = "\n\n".join(scan_result.pipeline_steps)
-                if len(steps_text) > 980:
-                    steps_text = steps_text[:980] + "\n... [Trace truncated due to character limit]"
                 embed.add_field(
-                    name="📋 AI Model Council Verification Trace",
-                    value=f"```yaml\n{steps_text}\n```",
+                    name="📋 Model Decision Summary",
+                    value=_human_trace_value(scan_result.pipeline_steps),
                     inline=False,
                 )
 
@@ -435,7 +543,7 @@ class AutoMod(commands.Cog):
             size_str = f"{size:,} bytes" if size else "Unknown"
             embed.add_field(
                 name="📎 Media Info",
-                value=f"**Name:** `{fname}`\n**Size:** `{size_str}`\n**Link:** [Open original file]({url})",
+                value=_trim_embed_value(f"**Name:** `{fname}`\n**Size:** `{size_str}`\n**Link:** [Open original file]({url})"),
                 inline=False
             )
 
@@ -518,7 +626,7 @@ class AutoMod(commands.Cog):
                         best_result = result
                         best_file_info = [(url, fname, size)]
 
-                    if result.verdict == "BLOCK":
+                    if result.verdict in _BLOCKING_VERDICTS:
                         break  # Stop processing on first block
 
                 if best_result is None or best_result.verdict == "SAFE":
@@ -527,7 +635,7 @@ class AutoMod(commands.Cog):
                 # Take action based on verdict
                 file_info = best_file_info or []
 
-                if best_result.verdict == "BLOCK":
+                if best_result.verdict in _BLOCKING_VERDICTS:
                     # Delete message
                     try:
                         await message.delete()
@@ -549,7 +657,7 @@ class AutoMod(commands.Cog):
                     # Log
                     await self._send_log_embed(message, best_result, file_info, "BLOCK", cfg)
 
-                elif best_result.verdict == "REVIEW":
+                elif best_result.verdict in _REVIEW_VERDICTS:
                     # Do NOT delete — just log for human review
                     await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
                     logger.info(

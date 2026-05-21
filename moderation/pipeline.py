@@ -23,12 +23,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Severity ordering for aggregation
-_SEVERITY: dict[str, int] = {"SAFE": 0, "REVIEW": 1, "BLOCK": 2}
+_SEVERITY: dict[str, int] = {
+    "SAFE": 0,
+    "SUGGESTIVE": 1,
+    "REVIEW": 1,
+    "NSFW": 2,
+    "BLOCK": 2,
+    "EXPLICIT": 3,
+}
 
 
 @dataclass
 class ScanResult:
-    verdict: str                           # "BLOCK" | "REVIEW" | "SAFE"
+    verdict: str                           # "SAFE" | "SUGGESTIVE" | "REVIEW" | "NSFW" | "BLOCK" | "EXPLICIT"
     reason: str                            # human-readable e.g. "MALE_GENITALIA_EXPOSED (0.73)"
     branch: str                            # "real" | "anime" | "prefilter_skip" | "both"
     model: str                             # which model made the final call
@@ -156,7 +163,7 @@ async def scan_attachment(
     Full pipeline: download → frame extraction → prefilter → gatekeeper → branch(es) → verdict.
 
     Always deletes the temp file in a finally block.
-    Returns ScanResult with verdict BLOCK | REVIEW | SAFE.
+    Returns ScanResult with verdict SAFE | SUGGESTIVE | REVIEW | NSFW | BLOCK | EXPLICIT.
     """
     start_time = time.monotonic()
 
@@ -323,7 +330,7 @@ async def scan_attachment(
                 steps.append(
                     f"Stage 2A: Real/Photo Branch\n"
                     f"  Model: NudeNet v3 (ONNX CPU)\n"
-                    f"  Target Explicit Labels: FEMALE_GENITALIA_EXPOSED, MALE_GENITALIA_EXPOSED, ANUS_EXPOSED, FEMALE_BREAST_EXPOSED\n"
+                    f"  Target Explicit Labels: FEMALE_GENITALIA_EXPOSED, MALE_GENITALIA_EXPOSED, ANUS_EXPOSED, MALE_GENITALIA_COVERED, FEMALE_BREAST_EXPOSED\n"
                     f"  Detected Explicit Labels: {detections_str}\n"
                     f"  Verdict: {branch_result.verdict}"
                 )
@@ -340,6 +347,8 @@ async def scan_attachment(
                 wdv3_exp = getattr(branch_result, 'wdv3_explicit', 0.0)
                 ar_r18 = getattr(branch_result, 'anime_rating_r18', 0.0)
                 gen_sc = getattr(branch_result, 'genital_score', 0.0)
+                breast_sc = getattr(branch_result, 'breast_score', 0.0)
+                sugg_sc = getattr(branch_result, 'suggestive_score', 0.0)
                 fin_sc = getattr(branch_result, 'final_score', 0.0)
 
                 steps.append(
@@ -348,14 +357,17 @@ async def scan_attachment(
                     f"    - SmilingWolf/wd-vit-large-tagger-v3 (ONNX CPU)\n"
                     f"    - deepghs/anime_rating (ONNX CPU)\n"
                     f"  Scores & Fusion Math:\n"
-                    f"    - wdv3_explicit: {wdv3_exp:.4f} (weight: 0.35)\n"
-                    f"    - anime_rating_r18: {ar_r18:.4f} (weight: 0.30)\n"
-                    f"    - genital_score: {gen_sc:.4f} (weight: 0.35)\n"
-                    f"    - Formula: ({wdv3_exp:.4f} * 0.35) + ({ar_r18:.4f} * 0.30) + ({gen_sc:.4f} * 0.35) = {fin_sc:.4f}\n"
-                    f"  Decision Thresholds:\n"
-                    f"    - BLOCK: >= 0.80\n"
-                    f"    - REVIEW: >= 0.65\n"
-                    f"    - SAFE: < 0.65\n"
+                    f"    - wdv3_explicit: {wdv3_exp:.4f} (weight: 0.30)\n"
+                    f"    - anime_rating_r18: {ar_r18:.4f} (weight: 0.25)\n"
+                    f"    - genital_score: {gen_sc:.4f} (weight: 0.30)\n"
+                    f"    - breast_score: {breast_sc:.4f} (weight: 0.15)\n"
+                    f"    - suggestive_score: {sugg_sc:.4f}\n"
+                    f"    - Formula: ({wdv3_exp:.4f} * 0.30) + ({ar_r18:.4f} * 0.25) + ({gen_sc:.4f} * 0.30) + ({breast_sc:.4f} * 0.15) = {fin_sc:.4f}\n"
+                    f"  Decision Tiers:\n"
+                    f"    - EXPLICIT: genital_score >= 0.80\n"
+                    f"    - NSFW: breast_score >= 0.75\n"
+                    f"    - SUGGESTIVE: fused score >= 0.65\n"
+                    f"    - SAFE: otherwise\n"
                     f"  Detected Explicit Tags: {tags_str}\n"
                     f"  Tagger Rating: {getattr(branch_result, 'rating', 'unknown')}\n"
                     f"  Verdict: {branch_result.verdict}"
@@ -385,6 +397,8 @@ async def scan_attachment(
                 anime_wdv3_exp = getattr(anime_res, 'wdv3_explicit', 0.0)
                 anime_ar_r18 = getattr(anime_res, 'anime_rating_r18', 0.0)
                 anime_gen_sc = getattr(anime_res, 'genital_score', 0.0)
+                anime_breast_sc = getattr(anime_res, 'breast_score', 0.0)
+                anime_sugg_sc = getattr(anime_res, 'suggestive_score', 0.0)
                 anime_fin_sc = getattr(anime_res, 'final_score', 0.0)
 
                 steps.append(
@@ -396,10 +410,12 @@ async def scan_attachment(
                     f"  Anime/Illustration Branch:\n"
                     f"    Models: SmilingWolf/wd-vit-large-tagger-v3 & deepghs/anime_rating (ONNX CPU)\n"
                     f"    Scores & Fusion Math:\n"
-                    f"      - wdv3_explicit: {anime_wdv3_exp:.4f} (weight: 0.35)\n"
-                    f"      - anime_rating_r18: {anime_ar_r18:.4f} (weight: 0.30)\n"
-                    f"      - genital_score: {anime_gen_sc:.4f} (weight: 0.35)\n"
-                    f"      - Formula: ({anime_wdv3_exp:.4f} * 0.35) + ({anime_ar_r18:.4f} * 0.30) + ({anime_gen_sc:.4f} * 0.35) = {anime_fin_sc:.4f}\n"
+                    f"      - wdv3_explicit: {anime_wdv3_exp:.4f} (weight: 0.30)\n"
+                    f"      - anime_rating_r18: {anime_ar_r18:.4f} (weight: 0.25)\n"
+                    f"      - genital_score: {anime_gen_sc:.4f} (weight: 0.30)\n"
+                    f"      - breast_score: {anime_breast_sc:.4f} (weight: 0.15)\n"
+                    f"      - suggestive_score: {anime_sugg_sc:.4f}\n"
+                    f"      - Formula: ({anime_wdv3_exp:.4f} * 0.30) + ({anime_ar_r18:.4f} * 0.25) + ({anime_gen_sc:.4f} * 0.30) + ({anime_breast_sc:.4f} * 0.15) = {anime_fin_sc:.4f}\n"
                     f"    Tagger Rating: {getattr(anime_res, 'rating', 'unknown')}\n"
                     f"    Detected Explicit Tags: {anime_tags_str}\n"
                     f"    Verdict: {anime_res.verdict}\n"
@@ -426,7 +442,7 @@ async def scan_attachment(
                 best_result = frame_scan
 
             # Early exit on BLOCK
-            if frame_scan.verdict == "BLOCK":
+            if frame_scan.verdict in {"BLOCK", "NSFW", "EXPLICIT"}:
                 logger.info(
                     "[Pipeline] BLOCK on frame %d — stopping early. Reason: %s",
                     frame_idx,
@@ -492,7 +508,9 @@ def _build_reason(branch_result) -> str:
         if branch_result.detections:
             top = sorted(branch_result.detections, key=lambda x: x[1], reverse=True)
             tags_part = ", " + ", ".join(f"{label} ({score:.2f})" for label, score, _ in top[:2])
-        return f"score={branch_result.final_score:.2f} (exp={branch_result.wdv3_explicit:.2f}, r18={branch_result.anime_rating_r18:.2f}, gen={branch_result.genital_score:.2f}{tags_part})"
+        breast = getattr(branch_result, "breast_score", 0.0)
+        suggestive = getattr(branch_result, "suggestive_score", 0.0)
+        return f"score={branch_result.final_score:.2f} (exp={branch_result.wdv3_explicit:.2f}, r18={branch_result.anime_rating_r18:.2f}, gen={branch_result.genital_score:.2f}, breast={breast:.2f}, sugg={suggestive:.2f}{tags_part})"
 
     if not branch_result.detections:
         return f"rating={getattr(branch_result, 'rating', 'unknown')} (score={branch_result.max_score:.2f})"

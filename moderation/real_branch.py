@@ -1,8 +1,9 @@
 """
-moderation/real_branch.py — Stage 2A: Real/photo content branch using NudeNet.
+moderation/real_branch.py - Stage 2A: Real/photo content branch using NudeNet.
 
-ONLY flags genital exposure per AGENTS.md genital-only policy.
-All other NudeNet labels (BREAST, BUTTOCKS, etc.) are completely ignored.
+NudeNet uses ONNX internally and runs on CPU. This branch improves detection on
+low-quality real images by running the same local detector over a few lightweight
+OpenCV-enhanced variants, then selecting the highest-confidence moderation label.
 """
 
 from __future__ import annotations
@@ -17,153 +18,295 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ── Genital-only label thresholds ─────────────────────────────────────────────
-# These are the exact class name strings NudeNet v3 returns in detection dicts.
-# All other NudeNet labels are DISCARDED before verdict logic runs — they cannot
-# influence the verdict, max_score, or the detections list in BranchResult.
-GENITAL_LABELS: dict[str, float] = {
+MODERATION_LABELS: dict[str, float] = {
     "FEMALE_GENITALIA_EXPOSED": 0.55,
-    "MALE_GENITALIA_EXPOSED":   0.55,
-    "ANUS_EXPOSED":             0.60,
-    "MALE_GENITALIA_COVERED":   0.75,  # only when erection is clearly evident
-    "FEMALE_BREAST_EXPOSED":    0.55,  # exposed female breasts block policy
+    "MALE_GENITALIA_EXPOSED": 0.55,
+    "ANUS_EXPOSED": 0.60,
+    "MALE_GENITALIA_COVERED": 0.75,
+    "FEMALE_BREAST_EXPOSED": 0.55,
 }
 
-# REVIEW window: score in [threshold - REVIEW_OFFSET, threshold) → REVIEW
 REVIEW_OFFSET: float = 0.15
+LOW_QUALITY_RETRY_LOW: float = 0.45
+LOW_QUALITY_RETRY_HIGH: float = 0.60
 
 
 @dataclass
 class BranchResult:
-    verdict: str                                         # "BLOCK" | "REVIEW" | "SAFE"
+    verdict: str
     detections: List[Tuple[str, float, Optional[list]]] = field(default_factory=list)
     max_score: float = 0.0
     model: str = "nudenet"
 
 
+def _to_rgb(image: Image.Image) -> Image.Image:
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        canvas = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        canvas.alpha_composite(image.convert("RGBA"))
+        return canvas.convert("RGB")
+    return image.convert("RGB")
+
+
+def preprocess_real_image(image: Image.Image) -> Image.Image:
+    """
+    Enhance low-quality real images before NudeNet inference.
+
+    Uses OpenCV only: preserve aspect ratio, upscale small images to a 640px
+    minimum dimension, reduce JPEG artifacts, normalize local contrast with CLAHE,
+    and apply mild sharpening without destroying skin detail.
+    """
+    import cv2
+    import numpy as np
+
+    rgb_image = _to_rgb(image)
+    original_width, original_height = rgb_image.size
+    rgb = np.array(rgb_image)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    height, width = bgr.shape[:2]
+    min_dim = min(width, height)
+    if min_dim < 640:
+        scale = 640.0 / float(min_dim)
+        new_size = (int(round(width * scale)), int(round(height * scale)))
+        bgr = cv2.resize(bgr, new_size, interpolation=cv2.INTER_CUBIC)
+        logger.debug(
+            "[RealBranch] Upscaled real image from %dx%d to %dx%d",
+            original_width,
+            original_height,
+            new_size[0],
+            new_size[1],
+        )
+
+    denoised = cv2.fastNlMeansDenoisingColored(bgr, None, 3, 3, 7, 21)
+
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+    l_channel = clahe.apply(l_channel)
+    contrast = cv2.merge((l_channel, a_channel, b_channel))
+    contrast_bgr = cv2.cvtColor(contrast, cv2.COLOR_LAB2BGR)
+
+    blurred = cv2.GaussianBlur(contrast_bgr, (0, 0), sigmaX=0.8, sigmaY=0.8)
+    sharpened = cv2.addWeighted(contrast_bgr, 1.25, blurred, -0.25, 0)
+    enhanced = cv2.cvtColor(sharpened, cv2.COLOR_BGR2RGB)
+
+    logger.debug(
+        "[RealBranch] Enhancement applied: original=%dx%d enhanced=%dx%d",
+        original_width,
+        original_height,
+        enhanced.shape[1],
+        enhanced.shape[0],
+    )
+    return Image.fromarray(enhanced)
+
+
+def _upscale_image(image: Image.Image, scale: float) -> Image.Image:
+    import cv2
+    import numpy as np
+
+    rgb_image = _to_rgb(image)
+    arr = np.array(rgb_image)
+    height, width = arr.shape[:2]
+    new_size = (int(round(width * scale)), int(round(height * scale)))
+    upscaled = cv2.resize(arr, new_size, interpolation=cv2.INTER_CUBIC)
+    logger.debug(
+        "[RealBranch] Created %.2fx upscale variant: %dx%d -> %dx%d",
+        scale,
+        width,
+        height,
+        new_size[0],
+        new_size[1],
+    )
+    return Image.fromarray(upscaled)
+
+
+def _center_crop(image: Image.Image, crop_ratio: float = 0.78) -> Image.Image:
+    rgb_image = _to_rgb(image)
+    width, height = rgb_image.size
+    crop_width = max(1, int(width * crop_ratio))
+    crop_height = max(1, int(height * crop_ratio))
+    left = (width - crop_width) // 2
+    top = (height - crop_height) // 2
+    cropped = rgb_image.crop((left, top, left + crop_width, top + crop_height))
+    logger.debug(
+        "[RealBranch] Created center crop variant: %dx%d -> %dx%d",
+        width,
+        height,
+        crop_width,
+        crop_height,
+    )
+    return cropped
+
+
 class RealBranch:
     """
-    Detects explicit genital content in real/photographic images using NudeNet.
-
-    NudeNet uses ONNX internally and runs entirely on CPU.
-    NudeDetector is instantiated once in __init__ so the ONNX model is loaded
-    from disk only once and reused across all scan() calls.
-    All inference is synchronous — wrap calls in asyncio.to_thread().
+    Detects exposed genitals, anus, and exposed female breasts in real images.
+    Callers wrap scan() in asyncio.to_thread() to keep Discord's event loop clear.
     """
 
     def __init__(self) -> None:
         self._detector = None
 
-    def scan(self, image: Image.Image) -> BranchResult:
+    def _ensure_detector(self) -> None:
         if self._detector is None:
             from nudenet import NudeDetector
+
             self._detector = NudeDetector()
             logger.info("[RealBranch] NudeDetector loaded")
 
-        """
-        Scan a PIL Image for genital content using NudeNet.
+    def _save_temp_jpeg(self, image: Image.Image, temp_paths: List[str]) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            temp_paths.append(tmp.name)
+            _to_rgb(image).save(tmp.name, format="JPEG", quality=95)
+            return tmp.name
 
-        Steps:
-          1. Save PIL image to a temp JPEG (NudeNet requires a file path).
-          2. Run NudeDetector.detect() — returns list of dicts with key 'class'.
-          3. FILTER FIRST — keep only dicts whose 'class' is in GENITAL_LABELS.
-             Every other detection is discarded here; nothing else touches verdict logic.
-          4. If zero genital detections remain → return SAFE immediately.
-          5. Determine BLOCK / REVIEW from the filtered list only.
-          6. Delete temp file in finally block regardless of outcome.
-        """
-        tmp_path: Optional[str] = None
+    def _detect_variant(self, image: Image.Image, variant_name: str, temp_paths: List[str]) -> List[dict]:
+        path = self._save_temp_jpeg(image, temp_paths)
+        raw = self._detector.detect(path)
+        logger.debug(
+            "[RealBranch] Variant '%s' produced %d raw NudeNet detections",
+            variant_name,
+            len(raw),
+        )
+        for detection in raw:
+            detection["_variant"] = variant_name
+        return raw
 
-        try:
-            # ── 1. Save to temp file ──────────────────────────────────────────
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                tmp_path = tmp.name
-                # Alpha composite transparency on a white background
-                if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
-                    canvas = Image.new("RGBA", image.size, (255, 255, 255))
-                    canvas.alpha_composite(image.convert("RGBA"))
-                    img_to_save = canvas.convert("RGB")
-                else:
-                    img_to_save = image.convert("RGB")
-                img_to_save.save(tmp_path, format="JPEG", quality=95)
+    def _filter_moderation_detections(self, raw_detections: List[dict]) -> List[dict]:
+        return [
+            detection
+            for detection in raw_detections
+            if detection.get("class", "") in MODERATION_LABELS
+        ]
 
-            # ── 2. Run NudeNet ────────────────────────────────────────────────
-            raw_detections: list[dict] = self._detector.detect(tmp_path)
-            # raw_detections format (NudeNet v3):
-            # [{"class": "FEMALE_BREAST_EXPOSED", "score": 0.91, "box": [x,y,w,h]}, ...]
+    def _max_relevant_score(self, detections: List[dict]) -> float:
+        if not detections:
+            return 0.0
+        return max(float(detection.get("score", 0.0)) for detection in detections)
 
-            # ── 3. FILTER FIRST — discard everything that isn't a genital label ──
-            # NudeNet v3 uses the key 'class', NOT 'label'.
-            genital_detections = [
-                d for d in raw_detections
-                if d.get("class", "") in GENITAL_LABELS
-            ]
+    def _is_near_threshold(self, detections: List[dict]) -> bool:
+        return any(
+            LOW_QUALITY_RETRY_LOW <= float(detection.get("score", 0.0)) <= LOW_QUALITY_RETRY_HIGH
+            for detection in detections
+        )
+
+    def _score_detections(self, detections: List[dict]) -> BranchResult:
+        flagged: List[Tuple[str, float, Optional[list]]] = []
+        max_score = 0.0
+        verdict = "SAFE"
+
+        detections.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+
+        for detection in detections:
+            label = detection["class"]
+            score = float(detection.get("score", 0.0))
+            box = detection.get("box")
+            threshold = MODERATION_LABELS[label]
+            review_low = threshold - REVIEW_OFFSET
 
             logger.debug(
-                "[RealBranch] raw=%d detections, genital=%d after filter",
+                "[RealBranch] %s score=%.3f threshold=%.2f review_low=%.2f variant=%s",
+                label,
+                score,
+                threshold,
+                review_low,
+                detection.get("_variant", "unknown"),
+            )
+
+            if score < review_low:
+                continue
+
+            flagged.append((label, score, box))
+            max_score = max(max_score, score)
+            if score >= threshold:
+                verdict = "BLOCK"
+            elif verdict != "BLOCK":
+                verdict = "REVIEW"
+
+        if not flagged:
+            return BranchResult(verdict="SAFE", max_score=0.0)
+
+        logger.info(
+            "[RealBranch] Verdict: %s | selected_confidence=%.3f | flagged=%s",
+            verdict,
+            max_score,
+            [(label, f"{score:.3f}") for label, score, _ in flagged],
+        )
+        return BranchResult(verdict=verdict, detections=flagged, max_score=max_score)
+
+    def scan(self, image: Image.Image) -> BranchResult:
+        self._ensure_detector()
+
+        temp_paths: List[str] = []
+        try:
+            rgb_image = _to_rgb(image)
+            logger.debug("[RealBranch] Original resolution: %dx%d", *rgb_image.size)
+
+            raw_detections: List[dict] = []
+
+            original_raw = self._detect_variant(rgb_image, "original", temp_paths)
+            raw_detections.extend(original_raw)
+            original_relevant = self._filter_moderation_detections(original_raw)
+            original_max = self._max_relevant_score(original_relevant)
+            logger.debug("[RealBranch] Original max moderation confidence: %.3f", original_max)
+
+            enhanced = preprocess_real_image(rgb_image)
+            enhanced_raw = self._detect_variant(enhanced, "enhanced", temp_paths)
+            raw_detections.extend(enhanced_raw)
+            enhanced_relevant = self._filter_moderation_detections(enhanced_raw)
+            enhanced_max = self._max_relevant_score(enhanced_relevant)
+            logger.debug(
+                "[RealBranch] Enhancement confidence before/after: %.3f -> %.3f",
+                original_max,
+                enhanced_max,
+            )
+
+            upscaled = _upscale_image(rgb_image, 1.25)
+            upscale_raw = self._detect_variant(upscaled, "upscale_1_25x", temp_paths)
+            raw_detections.extend(upscale_raw)
+
+            moderation_detections = self._filter_moderation_detections(raw_detections)
+            retry_triggered = self._is_near_threshold(moderation_detections)
+            logger.debug(
+                "[RealBranch] Retry triggered=%s (near-threshold window %.2f-%.2f)",
+                retry_triggered,
+                LOW_QUALITY_RETRY_LOW,
+                LOW_QUALITY_RETRY_HIGH,
+            )
+
+            if retry_triggered:
+                center_crop = _center_crop(enhanced)
+                crop_raw = self._detect_variant(center_crop, "enhanced_center_crop", temp_paths)
+                raw_detections.extend(crop_raw)
+                moderation_detections = self._filter_moderation_detections(raw_detections)
+
+            logger.debug(
+                "[RealBranch] raw=%d detections, moderation=%d after filter",
                 len(raw_detections),
-                len(genital_detections),
+                len(moderation_detections),
             )
 
-            # ── 4. Zero genital detections → SAFE immediately ─────────────────
-            if not genital_detections:
-                logger.debug("[RealBranch] No genital labels found → SAFE")
+            if not moderation_detections:
+                logger.debug("[RealBranch] No moderation labels found -> SAFE")
                 return BranchResult(verdict="SAFE", max_score=0.0)
 
-            # ── 5. Verdict logic — runs ONLY on genital_detections ─────────────
-            flagged: List[Tuple[str, float, Optional[list]]] = []
-            max_score: float = 0.0
-            verdict = "SAFE"
-
-            for detection in genital_detections:
-                label: str = detection["class"]          # already confirmed in GENITAL_LABELS
-                score: float = float(detection["score"])
-                box = detection.get("box")               # [x, y, w, h] or None
-
-                threshold: float = GENITAL_LABELS[label]
-                review_low: float = threshold - REVIEW_OFFSET
-
-                logger.debug(
-                    "[RealBranch] %s score=%.3f threshold=%.2f review_low=%.2f",
-                    label, score, threshold, review_low,
-                )
-
-                # Only include detections that are at least in the REVIEW window
-                if score >= review_low:
-                    flagged.append((label, score, box))
-                    if score > max_score:
-                        max_score = score
-
-                    # Escalate verdict — BLOCK wins immediately
-                    if score >= threshold:
-                        verdict = "BLOCK"
-                    elif verdict != "BLOCK":
-                        verdict = "REVIEW"
-
-            # If every genital detection was below the review window, still SAFE
-            if not flagged:
-                logger.debug("[RealBranch] Genital labels found but all below review window → SAFE")
-                return BranchResult(verdict="SAFE", max_score=0.0)
-
-            logger.info(
-                "[RealBranch] Verdict: %s | max_score=%.3f | flagged=%s",
-                verdict,
-                max_score,
-                [(lbl, f"{sc:.3f}") for lbl, sc, _ in flagged],
-            )
-            return BranchResult(verdict=verdict, detections=flagged, max_score=max_score)
+            result = self._score_detections(moderation_detections)
+            logger.debug("[RealBranch] Final selected confidence: %.3f", result.max_score)
+            return result
 
         except Exception as e:
             logger.error("[RealBranch] Scan error: %s", e, exc_info=True)
             return BranchResult(verdict="SAFE", max_score=0.0)
 
         finally:
-            # ── 6. Always delete the temp file ────────────────────────────────
-            if tmp_path and os.path.exists(tmp_path):
+            for path in temp_paths:
+                if not os.path.exists(path):
+                    continue
                 try:
-                    os.remove(tmp_path)
+                    os.remove(path)
                 except Exception as cleanup_err:
                     logger.warning(
                         "[RealBranch] Failed to clean up temp file %s: %s",
-                        tmp_path, cleanup_err,
+                        path,
+                        cleanup_err,
                     )

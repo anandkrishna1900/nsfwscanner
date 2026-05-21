@@ -1,10 +1,11 @@
 """
-moderation/anime_branch.py — Stage 2B: Anime/hentai content branch.
+moderation/anime_branch.py - Stage 2B: Anime/hentai content branch.
 
 Primary: SmilingWolf/wd-vit-large-tagger-v3 (WDv3) ONNX tagger.
-Secondary: deepghs/anime_rating ONNX (consulted for borderline questionable cases).
+Secondary: deepghs/anime_rating ONNX classifier.
 
-Block policy: fused model scores only count when strong genital evidence is present.
+Anime moderation tiers: SAFE, SUGGESTIVE, NSFW, EXPLICIT.
+Ratings are broad classifiers; anatomical evidence tags drive escalation.
 """
 
 from __future__ import annotations
@@ -12,26 +13,14 @@ from __future__ import annotations
 import csv
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ── Explicit tag vocabulary & Constants ───────────────────────────────────────
-EXPLICIT_TAGS: Set[str] = {
-    "penis",
-    "vagina",
-    "pussy",
-    "genitals",
-    "testicles",
-    "erection",
-    "phallus",
-    "anus",
-}
-
-GENITAL_THRESHOLDS: Dict[str, float] = {
+GENITAL_TAGS: Dict[str, float] = {
     "penis": 0.72,
     "vagina": 0.75,
     "pussy": 0.75,
@@ -42,6 +31,24 @@ GENITAL_THRESHOLDS: Dict[str, float] = {
     "phallus": 0.72,
 }
 
+BREAST_TAGS: Dict[str, float] = {
+    "nipples": 0.70,
+    "bare_breasts": 0.72,
+    "breasts_out": 0.75,
+    "areola_slip": 0.72,
+    "nipple_slip": 0.72,
+    "breast_slip": 0.72,
+    "one_breast_out": 0.72,
+    "topless": 0.68,
+    "large_areolae": 0.70,
+    "dark_areolae": 0.70,
+    "light_areolae": 0.70,
+    "puffy_nipples": 0.70,
+    "huge_nipples": 0.70,
+    "dark_nipples": 0.70,
+    "colored_nipples": 0.70,
+}
+
 SAFE_CONTEXT_TAGS: Dict[str, float] = {
     "bikini": 0.15,
     "swimsuit": 0.15,
@@ -50,15 +57,26 @@ SAFE_CONTEXT_TAGS: Dict[str, float] = {
     "panties": 0.12,
     "lingerie": 0.10,
     "cameltoe": 0.08,
+    "cleavage": 0.08,
+    "sideboob": 0.10,
+    "micro_bikini": 0.12,
 }
 
-# WDv3 input size
+SUGGESTIVE_TAGS: Dict[str, float] = {
+    "lingerie": 0.62,
+    "underboob": 0.60,
+    "cameltoe": 0.62,
+    "implied_nudity": 0.62,
+    "clothes_lift": 0.65,
+    "no_bra": 0.65,
+}
+
 _WDV3_INPUT_SIZE: int = 448
 
 
 @dataclass
 class BranchResult:
-    verdict: str                                         # "BLOCK" | "REVIEW" | "SAFE"
+    verdict: str
     detections: List[Tuple[str, float, Optional[dict]]] = field(default_factory=list)
     max_score: float = 0.0
     model: str = "wdv3_tagger"
@@ -66,18 +84,21 @@ class BranchResult:
     wdv3_explicit: float = 0.0
     anime_rating_r18: float = 0.0
     genital_score: float = 0.0
+    breast_score: float = 0.0
+    suggestive_score: float = 0.0
     final_score: float = 0.0
 
 
 class AnimeBranch:
     """
-    Anime/hentai content detector using WD-ViT-v3 tagger + deepghs/anime_rating.
-    All inference is synchronous — wrap calls in asyncio.to_thread().
+    Anime moderation using WDv3 + deepghs/anime_rating.
+    All inference is synchronous; callers wrap scan() in asyncio.to_thread().
     """
 
-    EXPLICIT_TAGS = EXPLICIT_TAGS
-    GENITAL_THRESHOLDS = GENITAL_THRESHOLDS
+    GENITAL_TAGS = GENITAL_TAGS
+    BREAST_TAGS = BREAST_TAGS
     SAFE_CONTEXT_TAGS = SAFE_CONTEXT_TAGS
+    SUGGESTIVE_TAGS = SUGGESTIVE_TAGS
 
     def __init__(self, cache_dir: str) -> None:
         self._cache_dir = cache_dir
@@ -90,14 +111,12 @@ class AnimeBranch:
         self._rating_input_name: Optional[str] = None
         self._rating_output_name: Optional[str] = None
 
-    # ── Loaders ───────────────────────────────────────────────────────────────
-
     def _load_wdv3(self) -> None:
         """Load WDv3 tagger ONNX and selected_tags.csv."""
         import onnxruntime as ort
         from huggingface_hub import hf_hub_download
 
-        logger.info("[AnimeBranch] Loading SmilingWolf/wd-vit-large-tagger-v3…")
+        logger.info("[AnimeBranch] Loading SmilingWolf/wd-vit-large-tagger-v3...")
 
         try:
             model_path = hf_hub_download(
@@ -124,7 +143,6 @@ class AnimeBranch:
         self._wdv3_input_name = self._wdv3_session.get_inputs()[0].name
         self._wdv3_output_name = self._wdv3_session.get_outputs()[0].name
 
-        # Parse selected_tags.csv to get tag names
         self._tag_names = []
         self._rating_indices = {}
         with open(tags_path, newline="", encoding="utf-8") as f:
@@ -133,19 +151,17 @@ class AnimeBranch:
                 tag = row.get("name", row.get("tag_id", ""))
                 category = row.get("category", "0")
                 self._tag_names.append(tag)
-                # Category 9 = rating tags in WDv3 schema
                 if str(category) == "9":
-                    idx = len(self._tag_names) - 1
-                    self._rating_indices[tag] = idx
+                    self._rating_indices[tag] = len(self._tag_names) - 1
 
         logger.info(
-            "[AnimeBranch] WDv3 ready — %d tags, %d rating tags",
+            "[AnimeBranch] WDv3 ready - %d tags, %d rating tags",
             len(self._tag_names),
             len(self._rating_indices),
         )
 
     def _load_anime_rating(self) -> None:
-        """Load deepghs/anime_rating ONNX primary model."""
+        """Load deepghs/anime_rating ONNX model."""
         import onnxruntime as ort
         from huggingface_hub import hf_hub_download, list_repo_files
 
@@ -156,15 +172,11 @@ class AnimeBranch:
             onnx_files = [f for f in repo_files if f.endswith(".onnx")]
             if not onnx_files:
                 raise RuntimeError("No ONNX files found in deepghs/anime_rating")
-            
+
             preferred = next(
                 (f for f in onnx_files if "caformer_s36_plus" in f.lower()),
-                next(
-                    (f for f in onnx_files if "caformer" in f.lower()),
-                    onnx_files[0]
-                )
+                next((f for f in onnx_files if "caformer" in f.lower()), onnx_files[0]),
             )
-            
             logger.info("[AnimeBranch] Selected anime rating model file: %s", preferred)
             model_path = hf_hub_download(
                 repo_id="deepghs/anime_rating",
@@ -173,7 +185,8 @@ class AnimeBranch:
             )
         except Exception as e:
             logger.warning(
-                "[AnimeBranch] Could not load deepghs/anime_rating: %s — evaluation might skip secondary probability", e
+                "[AnimeBranch] Could not load deepghs/anime_rating: %s - r18 score will be 0",
+                e,
             )
             return
 
@@ -188,25 +201,30 @@ class AnimeBranch:
         self._rating_output_name = self._rating_session.get_outputs()[0].name
         logger.info("[AnimeBranch] deepghs/anime_rating ready")
 
-    # ── Preprocessing ─────────────────────────────────────────────────────────
-
     def _preprocess_wdv3(self, image: Image.Image) -> np.ndarray:
-        """
-        WDv3 expects: RGB, resized to 448×448, values in [0,1], channels-last (NHWC).
-        Note: WDv3 uses BGR order internally — convert RGB→BGR before returning.
-        """
-        from utils.image_utils import prepare_image_for_onnx
-        return prepare_image_for_onnx(
-            image,
-            target_size=_WDV3_INPUT_SIZE,
-            to_bgr=True,
-            to_chw=False,
-            normalize_imagenet=False,
-        )
+        """WDv3 expects padded BGR NHWC float input in the 0..255 range."""
+        if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+            canvas = Image.new("RGBA", image.size, (255, 255, 255, 255))
+            canvas.alpha_composite(image.convert("RGBA"))
+            img = canvas.convert("RGB")
+        else:
+            img = image.convert("RGB")
+
+        width, height = img.size
+        max_dim = max(width, height)
+        padded = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
+        padded.paste(img, ((max_dim - width) // 2, (max_dim - height) // 2))
+        if max_dim != _WDV3_INPUT_SIZE:
+            padded = padded.resize((_WDV3_INPUT_SIZE, _WDV3_INPUT_SIZE), Image.BICUBIC)
+
+        arr = np.asarray(padded, dtype=np.float32)
+        arr = arr[:, :, ::-1]
+        return np.expand_dims(arr, axis=0).copy()
 
     def _preprocess_rating(self, image: Image.Image) -> np.ndarray:
-        """Preprocess for deepghs/anime_rating (standard ImageNet normalization, NCHW)."""
+        """Preprocess for deepghs/anime_rating."""
         from utils.image_utils import prepare_image_for_onnx
+
         return prepare_image_for_onnx(
             image,
             target_size=224,
@@ -214,31 +232,29 @@ class AnimeBranch:
             to_chw=True,
         )
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-
     def _run_wdv3(self, image: Image.Image) -> Tuple[str, float, Dict[str, float]]:
-        """
-        Run WDv3 inference.
-        Returns (rating_label, wdv3_explicit, tag_scores) where tag_scores is a Dict of all tag names and their scores.
-        """
+        """Return (rating_label, explicit_probability, all_tag_scores)."""
         inp = self._preprocess_wdv3(image)
-        outputs = self._wdv3_session.run([self._wdv3_output_name], {self._wdv3_input_name: inp})
-        scores = outputs[0][0]  # shape: (num_tags,)
+        outputs = self._wdv3_session.run(
+            [self._wdv3_output_name],
+            {self._wdv3_input_name: inp},
+        )
+        scores = outputs[0][0]
 
-        # Extract rating
         rating = "safe"
         best_rating_score = 0.0
         rating_scores: Dict[str, float] = {}
 
         if self._rating_indices:
             for r_label, r_idx in self._rating_indices.items():
-                if r_idx < len(scores):
-                    rating_scores[r_label.replace("rating:", "")] = float(scores[r_idx])
-                if r_idx < len(scores) and scores[r_idx] > best_rating_score:
-                    best_rating_score = scores[r_idx]
+                if r_idx >= len(scores):
+                    continue
+                clean_label = r_label.replace("rating:", "")
+                rating_scores[clean_label] = float(scores[r_idx])
+                if scores[r_idx] > best_rating_score:
+                    best_rating_score = float(scores[r_idx])
                     rating = r_label
         else:
-            # Fallback: look for rating tag names in the tag list
             rating_map = {
                 "rating:general": "general",
                 "rating:sensitive": "sensitive",
@@ -246,50 +262,35 @@ class AnimeBranch:
                 "rating:explicit": "explicit",
             }
             for full_tag, short_rating in rating_map.items():
-                if full_tag in self._tag_names:
-                    idx = self._tag_names.index(full_tag)
-                    rating_scores[short_rating] = float(scores[idx])
-                    if scores[idx] > best_rating_score:
-                        best_rating_score = scores[idx]
-                        rating = short_rating
+                if full_tag not in self._tag_names:
+                    continue
+                idx = self._tag_names.index(full_tag)
+                rating_scores[short_rating] = float(scores[idx])
+                if scores[idx] > best_rating_score:
+                    best_rating_score = float(scores[idx])
+                    rating = short_rating
 
-        # Normalize/clean rating label
+        tag_scores = {
+            tag: float(scores[i])
+            for i, tag in enumerate(self._tag_names)
+            if i < len(scores)
+        }
         clean_rating = rating.replace("rating:", "")
-
-        # Extract wdv3_explicit score
-        wdv3_explicit = 0.0
-        if self._rating_indices:
-            for r_label, r_idx in self._rating_indices.items():
-                if "explicit" in r_label.lower() and r_idx < len(scores):
-                    wdv3_explicit = float(scores[r_idx])
-        
-        if wdv3_explicit == 0.0:
-            for full_tag in ["rating:explicit", "explicit"]:
-                if full_tag in self._tag_names:
-                    idx = self._tag_names.index(full_tag)
-                    wdv3_explicit = float(scores[idx])
-                    break
-
-        # Extract all tag scores (in a dict)
-        tag_scores: Dict[str, float] = {}
-        for i, tag in enumerate(self._tag_names):
-            if i < len(scores):
-                tag_scores[tag] = float(scores[i])
+        wdv3_explicit = rating_scores.get("explicit", tag_scores.get("rating:explicit", 0.0))
+        questionable = rating_scores.get("questionable", 0.0)
 
         logger.debug(
-            "[AnimeBranch] WDv3 rating=%s (%.3f), rating_scores=%s, explicit_score=%.3f",
+            "[AnimeBranch] WDv3 rating=%s (%.3f), rating_scores=%s, explicit=%.3f, questionable=%.3f",
             clean_rating,
             best_rating_score,
             {k: round(v, 3) for k, v in rating_scores.items()},
             wdv3_explicit,
+            questionable,
         )
-        return clean_rating, wdv3_explicit, tag_scores
+        return clean_rating, float(wdv3_explicit), tag_scores
 
     def _run_anime_rating(self, image: Image.Image) -> Tuple[str, float]:
-        """
-        Run deepghs/anime_rating classifier.
-        Returns (label, r18_prob).
-        """
+        """Return (label, r18_probability)."""
         if self._rating_session is None:
             try:
                 self._load_anime_rating()
@@ -303,7 +304,8 @@ class AnimeBranch:
         try:
             inp = self._preprocess_rating(image)
             outputs = self._rating_session.run(
-                [self._rating_output_name], {self._rating_input_name: inp}
+                [self._rating_output_name],
+                {self._rating_input_name: inp},
             )
             raw = outputs[0][0]
 
@@ -313,20 +315,16 @@ class AnimeBranch:
 
             probs = softmax(raw) if raw.max() > 1.0 or raw.min() < 0.0 else raw
             best_idx = int(np.argmax(probs))
-
-            # deepghs/anime_rating labels: [safe, r15, r18]
-            rating_labels = ["safe", "r15", "r18"]
-            label = rating_labels[best_idx] if best_idx < len(rating_labels) else "safe"
-            
-            # The r18 probability is probs[2]
+            labels = ["safe", "r15", "r18"]
+            label = labels[best_idx] if best_idx < len(labels) else "safe"
             r18_prob = float(probs[2]) if len(probs) > 2 else 0.0
             rating_scores = {
-                rating_labels[i]: round(float(probs[i]), 3)
-                for i in range(min(len(rating_labels), len(probs)))
+                labels[i]: round(float(probs[i]), 3)
+                for i in range(min(len(labels), len(probs)))
             }
-            
+
             logger.debug(
-                "[AnimeBranch] anime_rating -> %s (%.3f), scores=%s, r18_prob=%.3f",
+                "[AnimeBranch] anime_rating=%s (%.3f), scores=%s, r18=%.3f",
                 label,
                 float(probs[best_idx]),
                 rating_scores,
@@ -337,83 +335,111 @@ class AnimeBranch:
             logger.warning("[AnimeBranch] anime_rating inference error: %s", e)
             return "safe", 0.0
 
-    # ── Score Fusion Helpers ──────────────────────────────────────────────────
-
-    def calculate_genital_score(self, tag_scores: Dict[str, float]) -> float:
-        """
-        Calculates the raw genital score as the maximum score among genital tags that
-        cross their respective GENITAL_THRESHOLDS. If no genital tag crosses its
-        threshold, returns 0.0 to eliminate low-confidence noise.
-        """
-        genital_score = 0.0
-        for tag, threshold in self.GENITAL_THRESHOLDS.items():
-            score = tag_scores.get(tag, 0.0)
-            if score >= threshold:
-                genital_score = max(genital_score, score)
+    def _threshold_score(self, tag_scores: Dict[str, float], thresholds: Dict[str, float], group: str) -> float:
+        score = 0.0
+        debug_scores: Dict[str, float] = {}
+        for tag, threshold in thresholds.items():
+            tag_score = tag_scores.get(tag, 0.0)
+            if tag_score > 0.0:
+                debug_scores[tag] = round(tag_score, 3)
+            if tag_score >= threshold:
+                score = max(score, tag_score)
                 logger.debug(
-                    "[AnimeBranch] Genital tag '%s' score %.3f exceeds threshold %.3f",
+                    "[AnimeBranch] %s tag '%s' score %.3f exceeded threshold %.3f",
+                    group,
                     tag,
-                    score,
+                    tag_score,
                     threshold,
                 )
+        logger.debug("[AnimeBranch] %s tag scores=%s, group_score=%.3f", group, debug_scores, score)
+        return score
 
-        if genital_score == 0.0:
-            debug_scores = {
-                tag: round(tag_scores.get(tag, 0.0), 3)
-                for tag in sorted(self.GENITAL_THRESHOLDS)
-                if tag_scores.get(tag, 0.0) > 0.0
-            }
-            logger.debug(
-                "[AnimeBranch] No genital tags exceeded thresholds; genital tag scores=%s",
-                debug_scores,
-            )
-        return genital_score
+    def calculate_genital_score(self, tag_scores: Dict[str, float]) -> float:
+        return self._threshold_score(tag_scores, self.GENITAL_TAGS, "genital")
 
-    def apply_negative_suppression(self, genital_score: float, wdv3_scores: Dict[str, float]) -> float:
-        """
-        If any safe context tag is strongly present (>0.70), reduce the genital score by its penalty.
-        Caps the final result at 0.0.
-        """
-        original_score = genital_score
+    def calculate_breast_score(self, tag_scores: Dict[str, float]) -> float:
+        raw_score = self._threshold_score(tag_scores, self.BREAST_TAGS, "breast")
+        if raw_score > 0.0:
+            return max(raw_score, 0.75)
+        return 0.0
+
+    def calculate_suggestive_score(self, tag_scores: Dict[str, float]) -> float:
+        return self._threshold_score(tag_scores, self.SUGGESTIVE_TAGS, "suggestive")
+
+    def apply_negative_suppression(
+        self,
+        genital_score: float,
+        breast_score: float,
+        suggestive_score: float,
+        tag_scores: Dict[str, float],
+    ) -> Tuple[float, float, float]:
+        """Reduce anatomical confidence when safe context tags dominate."""
         penalty = 0.0
-        for tag, val in self.SAFE_CONTEXT_TAGS.items():
-            score = wdv3_scores.get(tag, 0.0)
+        active_context: Dict[str, float] = {}
+        for tag, value in self.SAFE_CONTEXT_TAGS.items():
+            score = tag_scores.get(tag, 0.0)
             if score > 0.70:
-                penalty += val
-                logger.debug("[AnimeBranch] Negative suppression: tag '%s' score = %.3f, penalty = %.3f", tag, score, val)
-        
-        suppressed_score = max(0.0, genital_score - penalty)
-        logger.debug(
-            "[AnimeBranch] Suppression adjustments: raw_genital_score=%.3f, penalty=%.3f, suppressed_genital_score=%.3f",
-            original_score,
-            penalty,
-            suppressed_score,
-        )
-        return suppressed_score
+                penalty += value
+                active_context[tag] = round(score, 3)
 
-    def fuse_scores(self, wdv3_explicit: float, anime_rating_r18: float, genital_score: float) -> float:
-        """
-        Fuses the scores using the exact weighted score formula:
-        final_score = wdv3_explicit * 0.35 + anime_rating_r18 * 0.30 + genital_score * 0.35
-        """
-        final_score = (wdv3_explicit * 0.35) + (anime_rating_r18 * 0.30) + (genital_score * 0.35)
-        logger.debug("[AnimeBranch] Score Fusion: wdv3_explicit=%.3f * 0.35, anime_rating_r18=%.3f * 0.30, genital_score=%.3f * 0.35 -> final_score=%.3f",
-                     wdv3_explicit, anime_rating_r18, genital_score, final_score)
+        suppressed_genital = max(0.0, genital_score - penalty)
+        suppressed_breast = max(0.0, breast_score - (penalty * 0.75))
+        suppressed_suggestive = max(0.0, suggestive_score - (penalty * 0.50))
+
+        logger.debug(
+            "[AnimeBranch] Suppression adjustments: context=%s, penalty=%.3f, genital %.3f->%.3f, breast %.3f->%.3f, suggestive %.3f->%.3f",
+            active_context,
+            penalty,
+            genital_score,
+            suppressed_genital,
+            breast_score,
+            suppressed_breast,
+            suggestive_score,
+            suppressed_suggestive,
+        )
+        return suppressed_genital, suppressed_breast, suppressed_suggestive
+
+    def fuse_scores(
+        self,
+        wdv3_explicit: float,
+        anime_rating_r18: float,
+        genital_score: float,
+        breast_score: float,
+    ) -> float:
+        final_score = (
+            wdv3_explicit * 0.30
+            + anime_rating_r18 * 0.25
+            + genital_score * 0.30
+            + breast_score * 0.15
+        )
+        logger.debug(
+            "[AnimeBranch] Score fusion: explicit=%.3f*0.30 + r18=%.3f*0.25 + genital=%.3f*0.30 + breast=%.3f*0.15 => %.3f",
+            wdv3_explicit,
+            anime_rating_r18,
+            genital_score,
+            breast_score,
+            final_score,
+        )
         return final_score
 
-    # ── Public scan ───────────────────────────────────────────────────────────
+    def _build_detections(
+        self,
+        tag_scores: Dict[str, float],
+        thresholds: Dict[str, float],
+    ) -> List[Tuple[str, float, Optional[dict]]]:
+        detections: List[Tuple[str, float, Optional[dict]]] = []
+        for tag, threshold in thresholds.items():
+            score = tag_scores.get(tag, 0.0)
+            if score >= threshold:
+                detections.append((tag, score, None))
+        return detections
 
     def scan(self, image: Image.Image) -> BranchResult:
         """
-        Scan an anime/illustration image using premium weighted score fusion.
-        
-        Formula:
-          final_score = wdv3_explicit * 0.35 + anime_rating_r18 * 0.30 + genital_score * 0.35
-          
-        Decision logic:
-          - BLOCK: final_score >= 0.80
-          - REVIEW: final_score >= 0.65
-          - SAFE: final_score < 0.65
+        Return SAFE, SUGGESTIVE, NSFW, or EXPLICIT.
+
+        Explicit/questionable ratings never block by themselves. Escalation requires
+        genital or breast evidence; questionable only contributes through model scores.
         """
         if self._wdv3_session is None:
             try:
@@ -423,68 +449,69 @@ class AnimeBranch:
                 return BranchResult(verdict="SAFE")
 
         try:
-            # 1. Run WDv3 Tagger
-            rating, wdv3_explicit, wdv3_scores = self._run_wdv3(image)
-
-            # 2. Run anime_rating on all scans
+            rating, wdv3_explicit, tag_scores = self._run_wdv3(image)
             anime_label, anime_rating_r18 = self._run_anime_rating(image)
 
-            # 3. Calculate raw genital score. Ratings alone never decide a verdict.
-            genital_tag_scores: Dict[str, float] = {
-                tag: wdv3_scores.get(tag, 0.0)
-                for tag in self.GENITAL_THRESHOLDS
-            }
-            raw_genital_score = self.calculate_genital_score(wdv3_scores)
+            raw_genital_score = self.calculate_genital_score(tag_scores)
+            raw_breast_score = self.calculate_breast_score(tag_scores)
+            raw_suggestive_score = self.calculate_suggestive_score(tag_scores)
+            genital_score, breast_score, suggestive_score = self.apply_negative_suppression(
+                raw_genital_score,
+                raw_breast_score,
+                raw_suggestive_score,
+                tag_scores,
+            )
+            final_score = self.fuse_scores(
+                wdv3_explicit,
+                anime_rating_r18,
+                genital_score,
+                breast_score,
+            )
 
-            # 4. Apply negative suppression
-            genital_score = self.apply_negative_suppression(raw_genital_score, wdv3_scores)
-
-            # 5. Perform weighted score fusion
-            final_score = self.fuse_scores(wdv3_explicit, anime_rating_r18, genital_score)
-
-            # Build detections only from genital tags that cross their tag-specific threshold.
-            detections = []
-            for tag, score in genital_tag_scores.items():
-                if score >= self.GENITAL_THRESHOLDS[tag]:
-                    detections.append((tag, score, None))
-            detections.sort(key=lambda x: x[1], reverse=True)
-
-            # Determine verdict. Strong genital evidence is required for BLOCK/REVIEW;
-            # WDv3 explicit/questionable ratings alone are broad classifiers, not final detectors.
-            if genital_score <= 0.0:
-                verdict = "SAFE"
-            elif final_score >= 0.80:
-                verdict = "BLOCK"
+            if genital_score >= 0.80:
+                verdict = "EXPLICIT"
+            elif breast_score >= 0.75:
+                verdict = "NSFW"
             elif final_score >= 0.65:
-                verdict = "REVIEW"
+                verdict = "SUGGESTIVE"
             else:
                 verdict = "SAFE"
 
-            model_used = "score_fusion" if verdict != "SAFE" else "wdv3_tagger"
+            detections = []
+            detections.extend(self._build_detections(tag_scores, self.GENITAL_TAGS))
+            detections.extend(self._build_detections(tag_scores, self.BREAST_TAGS))
+            if verdict == "SUGGESTIVE":
+                detections.extend(self._build_detections(tag_scores, self.SUGGESTIVE_TAGS))
+            detections.sort(key=lambda item: item[1], reverse=True)
 
+            max_score = max(
+                [genital_score, breast_score, suggestive_score, final_score],
+                default=0.0,
+            )
             logger.info(
-                "[AnimeBranch] Scan Result - verdict=%s, rating=%s, anime_rating=%s, final_score=%.3f (wdv3_explicit=%.3f, r18=%.3f, genital=%.3f)",
+                "[AnimeBranch] Scan result - verdict=%s, rating=%s, anime_rating=%s, final=%.3f, genital=%.3f, breast=%.3f, suggestive=%.3f",
                 verdict,
                 rating,
                 anime_label,
                 final_score,
-                wdv3_explicit,
-                anime_rating_r18,
-                genital_score
+                genital_score,
+                breast_score,
+                suggestive_score,
             )
 
             return BranchResult(
                 verdict=verdict,
                 detections=detections,
-                max_score=max(genital_tag_scores.values()) if genital_tag_scores else 0.0,
-                model=model_used,
+                max_score=max_score,
+                model="anime_score_fusion" if verdict != "SAFE" else "wdv3_tagger",
                 rating=rating,
                 wdv3_explicit=wdv3_explicit,
                 anime_rating_r18=anime_rating_r18,
                 genital_score=genital_score,
-                final_score=final_score
+                breast_score=breast_score,
+                suggestive_score=suggestive_score,
+                final_score=final_score,
             )
-
         except Exception as e:
             logger.error("[AnimeBranch] Scan error: %s", e, exc_info=True)
             return BranchResult(verdict="SAFE")
