@@ -233,15 +233,36 @@ class AutoMod(commands.Cog):
 
     # ── Image URL extraction ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_discord_cdn_url(url: str) -> bool:
+        """True if url is a Discord attachment CDN/media URL."""
+        return (
+            "cdn.discordapp.com/attachments/" in url
+            or "media.discordapp.net/attachments/" in url
+        )
+
+    @staticmethod
+    def _discord_url_has_auth(url: str) -> bool:
+        """True if the Discord CDN URL contains the required expiring auth params."""
+        return "ex=" in url and "is=" in url
+
     def extract_media_urls(self, message: discord.Message) -> list[tuple[str, str, int]]:
         """
-        Extract media URLs from attachments, embeds, and message content.
+        Extract scannable media URLs from attachments, embeds, and message text.
         Returns list of (url, filename, size_bytes).
+
+        Discord CDN URLs require expiring auth params (ex=, is=, hm=).
+        Bare CDN links pasted as text almost never have them, so we:
+          1. Prefer direct message.attachments (always signed by discord.py).
+          2. Use embed.image.proxy_url if it has auth params.
+          3. For text-pasted CDN links: only accept them if they carry auth params.
+             Otherwise skip — they will 404 on download.
+          4. Non-Discord external URLs (imgur, etc.) are always accepted as-is.
         """
         results: list[tuple[str, str, int]] = []
 
+        # ── 1. Direct attachments — discord.py always gives fresh signed URLs ──
         for att in message.attachments:
-            # Only process image/gif/video content
             ct = att.content_type or ""
             if any(ct.startswith(prefix) for prefix in ("image/", "video/")):
                 results.append((att.url, att.filename, att.size))
@@ -250,26 +271,72 @@ class AutoMod(commands.Cog):
             ):
                 results.append((att.url, att.filename, att.size))
 
+        # ── 2. Embeds — Discord auto-generates these for pasted links ──────────
+        # proxy_url is Discord's own cached copy; it may or may not carry auth.
+        # Build a lookup so step 3 can upgrade bare text links to proxied URLs.
+        embed_proxy_lookup: dict[str, str] = {}
         for embed in message.embeds:
-            if embed.image and embed.image.url:
-                results.append((embed.image.url, "embed_image", 0))
+            for img_obj in (embed.image, embed.thumbnail):
+                if not img_obj or not img_obj.url:
+                    continue
+                clean_key = img_obj.url.split("?")[0]
+                # Pick the best URL candidate: proxy first, then original
+                for candidate in (img_obj.proxy_url, img_obj.url):
+                    if not candidate:
+                        continue
+                    # Only use Discord CDN candidates that have auth params
+                    if self._is_discord_cdn_url(candidate) and not self._discord_url_has_auth(candidate):
+                        continue
+                    embed_proxy_lookup[clean_key] = candidate
+                    results.append((candidate, "embed_image", 0))
+                    break  # stop at first usable candidate
 
+        # ── 3. URLs found in message text ──────────────────────────────────────
         if message.content:
             patterns = [
-                r"https?://[^\s]+\.(?:jpg|jpeg|png|gif|webp|mp4|webm|mov)",
+                r"https?://[^\s]+?\.(?:jpg|jpeg|png|gif|webp|mp4|webm|mov)(?:\?[^\s]*)?",
                 r"https?://cdn\.discordapp\.com/attachments/[^\s]+",
                 r"https?://media\.discordapp\.net/attachments/[^\s]+",
                 r"https?://i\.imgur\.com/[^\s]+",
             ]
-            seen = {u for u, _, _ in results}
+            seen_clean = {u.split("?")[0] for u, _, _ in results}
             for pat in patterns:
                 for match in re.findall(pat, message.content, re.IGNORECASE):
                     clean = match.split("?")[0]
-                    if clean not in seen:
-                        results.append((clean, "linked_image", 0))
-                        seen.add(clean)
+                    if clean in seen_clean:
+                        continue
+
+                    fname = "linked_image"
+                    try:
+                        path_part = clean.split("/")[-1]
+                        if path_part and "." in path_part:
+                            fname = path_part
+                    except Exception:
+                        pass
+
+                    # Prefer embed proxy URL if Discord already resolved it
+                    if clean in embed_proxy_lookup:
+                        resolved = embed_proxy_lookup[clean]
+                    elif self._is_discord_cdn_url(clean):
+                        # Bare Discord CDN link — only usable if auth params are present.
+                        # Without ex=, is=, hm= the CDN returns HTTP 404.
+                        if self._discord_url_has_auth(match):
+                            resolved = match
+                        else:
+                            logger.debug(
+                                "⏩ Skipping bare Discord CDN link (no auth params): %s", clean
+                            )
+                            seen_clean.add(clean)
+                            continue
+                    else:
+                        # External URL (imgur, etc.) — keep full match with any params
+                        resolved = match
+
+                    results.append((resolved, fname, 0))
+                    seen_clean.add(clean)
 
         return results
+
 
     # ── Action helpers ────────────────────────────────────────────────────────
 
@@ -661,26 +728,55 @@ class AutoMod(commands.Cog):
                     inline=False,
                 )
 
-            # File Info
+            # File Info — redact raw URL for non-SAFE verdicts
             size_str = f"{size:,} bytes" if size else "Unknown"
-            embed.add_field(
-                name="📎 Media Info",
-                value=_trim_embed_value(f"**Name:** `{fname}`\n**Size:** `{size_str}`\n**Link:** [Open original file]({url})"),
-                inline=False
-            )
+            is_nsfw_verdict = scan_result.verdict != "SAFE"
 
-            # Set image preview
+            # Determine the real extension from URL path (fname may be "embed_image")
+            _url_path = url.split("?")[0].lower()
+            _img_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+            _vid_exts = (".mp4", ".webm", ".mov", ".avi")
+            _is_image = any(_url_path.endswith(e) for e in _img_exts)
+            _is_video = any(_url_path.endswith(e) for e in _vid_exts)
+
+            if is_nsfw_verdict:
+                # Never expose the raw URL — moderators can find the original via Message ID
+                media_info_value = _trim_embed_value(
+                    f"**Name:** `{fname}`\n"
+                    f"**Size:** `{size_str}`\n"
+                    f"**Link:** `[redacted — see spoiler preview below]`"
+                )
+            else:
+                media_info_value = _trim_embed_value(
+                    f"**Name:** `{fname}`\n**Size:** `{size_str}`\n**Link:** [Open original file]({url})"
+                )
+
+            embed.add_field(name="📎 Media Info", value=media_info_value, inline=False)
+
+            # Image preview — spoilered for any non-SAFE verdict
             preview_file = None
-            if any(fname.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")):
-                if scan_result.verdict == "SAFE":
+            if _is_image:
+                if not is_nsfw_verdict:
+                    # Safe content: show inline in the embed
                     embed.set_image(url=url)
                 else:
+                    # Non-safe: download and attach as spoiler
                     try:
                         async with aiohttp.ClientSession() as session:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                                 if resp.status == 200:
                                     data = await resp.read()
-                                    safe_fname = fname if fname.upper().startswith("SPOILER_") else f"SPOILER_{fname}"
+                                    # Derive a real filename from the URL if fname is generic
+                                    base_fname = fname
+                                    if not any(fname.lower().endswith(e) for e in _img_exts):
+                                        try:
+                                            base_fname = _url_path.split("/")[-1] or fname
+                                        except Exception:
+                                            pass
+                                    safe_fname = (
+                                        base_fname if base_fname.upper().startswith("SPOILER_")
+                                        else f"SPOILER_{base_fname}"
+                                    )
                                     preview_file = discord.File(
                                         fp=BytesIO(data),
                                         filename=safe_fname,
@@ -689,6 +785,15 @@ class AutoMod(commands.Cog):
                                     embed.set_image(url=f"attachment://{safe_fname}")
                     except Exception as e:
                         logger.debug("Could not download debug image for spoiler: %s", e)
+                        # Do NOT fall back to showing the raw URL — leave image blank
+
+            elif _is_video and is_nsfw_verdict:
+                # Videos can't be spoilered via Discord embeds; note it in the field
+                embed.add_field(
+                    name="🎬 Video Preview",
+                    value="⚠️ *Video hidden — non-SAFE verdict. Check the original channel.*",
+                    inline=False,
+                )
 
             # ── Build feedback buttons view ───────────────────────────────────
             try:
@@ -770,6 +875,10 @@ class AutoMod(commands.Cog):
                 for url, fname, size in media_list:
                     try:
                         result = await scan_attachment(url, bot_config)
+                    except IOError as e:
+                        # Download failed (404, 403, timeout, etc.) — skip silently
+                        logger.warning("⏭️ Skipping undownloadable URL [%s]: %s", fname, e)
+                        continue
                     except Exception as e:
                         logger.error("Pipeline error for %s: %s", url, e, exc_info=True)
                         continue

@@ -200,20 +200,9 @@ async def scan_attachment(
             )
         except Exception as e:
             logger.warning("[Pipeline] Download failed for %s: %s", attachment_url, e)
-            elapsed = (time.monotonic() - start_time) * 1000
-            return ScanResult(
-                verdict="SAFE",
-                reason=f"Download error: {e}",
-                branch="download_error",
-                model="none",
-                frame_index=None,
-                processing_time_ms=elapsed,
-                pipeline_steps=[
-                    "Download Stage:\n"
-                    "  Status: Failed\n"
-                    f"  Error: {str(e)}"
-                ]
-            )
+            # Re-raise so the caller (on_message) can skip this URL instead of
+            # treating a stale/expired/blocked link as SAFE.
+            raise IOError(f"Download error: {e}") from e
 
         # ── Frame extraction ──────────────────────────────────────────────────
         from moderation.frame_extractor import (
