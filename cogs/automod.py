@@ -22,6 +22,8 @@ import aiohttp
 import discord
 from discord.ext import commands
 from config import config as bot_config
+from bot.ui.feedback_view import ModerationFeedbackView
+from moderation.feedback_manager import _extract_model_scores, _extract_detected_tags
 
 logger = logging.getLogger(__name__)
 
@@ -327,7 +329,7 @@ class AutoMod(commands.Cog):
         verdict: str,
         cfg: dict,
     ) -> None:
-        """Send a detailed log embed to the configured log channel."""
+        """Send a detailed log embed to the configured log channel with feedback buttons."""
         log_channel_id = bot_config.log_channel_id or cfg.get("log_channel")
         if not log_channel_id:
             logger.warning("NSFW log channel is not configured; cannot send moderation log")
@@ -345,7 +347,17 @@ class AutoMod(commands.Cog):
 
         member = message.author
         now = discord.utils.utcnow()
-        color = 0xFF4444 if verdict == "BLOCK" else 0xFFA500
+
+        # ── Enhanced color coding ──────────────────────────────────────────────
+        _COLOR_MAP = {
+            "SAFE":      0x22C55E,  # green
+            "SUGGESTIVE": 0xF59E0B, # yellow
+            "REVIEW":    0xF59E0B,  # yellow
+            "NSFW":      0xEF4444,  # orange-red
+            "BLOCK":     0xEF4444,  # orange-red
+            "EXPLICIT":  0xDC2626,  # deep red
+        }
+        color = _COLOR_MAP.get(scan_result.verdict, 0xFF4444)
 
         title = (
             "🚨 NSFW Content Detected — BLOCKED"
@@ -356,13 +368,14 @@ class AutoMod(commands.Cog):
         embed = discord.Embed(title=title, color=color, timestamp=now)
         embed.set_thumbnail(url=member.display_avatar.url)
 
-        embed.add_field(name="User", value=f"{member.mention} (`{member.id}`)", inline=True)
-        embed.add_field(name="Channel", value=message.channel.mention, inline=True)
-        embed.add_field(name="Message ID", value=f"`{message.id}`", inline=True)
+        # ── User & context fields ──────────────────────────────────────────────
+        embed.add_field(name="👤 User", value=f"{member.mention} (`{member.id}`)", inline=True)
+        embed.add_field(name="📺 Channel", value=message.channel.mention, inline=True)
+        embed.add_field(name="💬 Message ID", value=f"`{message.id}`", inline=True)
 
         acct_ts = int(member.created_at.timestamp())
         embed.add_field(
-            name="👤 Account",
+            name="🗓️ Account",
             value=f"**Created:** <t:{acct_ts}:R>\n**Name:** {member.name}",
             inline=True,
         )
@@ -375,19 +388,62 @@ class AutoMod(commands.Cog):
                 inline=True,
             )
 
-        # AI detection info
+        # ── AI Detection Summary ───────────────────────────────────────────────
+        # Verdict badge
+        verdict_badge = {
+            "EXPLICIT": "🔴 EXPLICIT",
+            "NSFW":     "🟠 NSFW",
+            "BLOCK":    "🟠 BLOCKED",
+            "REVIEW":   "🟡 REVIEW",
+            "SUGGESTIVE": "🟡 SUGGESTIVE",
+            "SAFE":     "🟢 SAFE",
+        }.get(scan_result.verdict, scan_result.verdict)
+
+        # Content type / branch label
+        branch_label = {
+            "real":  "📷 Real/Photo",
+            "anime": "🎨 Anime/Illustration",
+            "both":  "🔀 Both (Uncertain)",
+        }.get(scan_result.branch, scan_result.branch)
+
+        # Confidence from reason string (best effort)
+        confidence_str = ""
+        if scan_result.reason and "score=" in scan_result.reason:
+            try:
+                confidence_str = f"\n**Confidence:** `{scan_result.reason.split('score=')[1].split()[0].rstrip(',)')}`"
+            except Exception:
+                pass
+
         embed.add_field(
             name="🤖 AI Detection Summary",
             value=_trim_embed_value(
-                f"**Verdict:** `{scan_result.verdict}`\n"
-                f"**Reason:** {scan_result.reason}\n"
-                f"**Branch:** {scan_result.branch}\n"
-                f"**Model:** {scan_result.model}\n"
-                f"**Time:** {scan_result.processing_time_ms:.0f}ms"
-                + (f"\n**Frame:** #{scan_result.frame_index}" if scan_result.frame_index is not None else "")
+                f"**Verdict:** {verdict_badge}\n"
+                f"**Content Type:** {branch_label}\n"
+                f"**Model:** `{scan_result.model}`\n"
+                f"**Processing Time:** `{scan_result.processing_time_ms:.0f}ms`"
+                f"{confidence_str}"
+                + (f"\n**Triggered Frame:** `#{scan_result.frame_index}`" if scan_result.frame_index is not None else "")
             ),
             inline=False,
         )
+
+        # ── Detected tags / labels ─────────────────────────────────────────────
+        detected_tags = _extract_detected_tags(scan_result)
+        if detected_tags:
+            tag_lines = [f"`{tag}` — `{score:.2f}`" for tag, score in detected_tags[:8]]
+            embed.add_field(
+                name="🔍 Detected Tags / Labels",
+                value=_trim_embed_value("\n".join(tag_lines)),
+                inline=False,
+            )
+
+        # ── Reason / model trace ───────────────────────────────────────────────
+        if scan_result.reason:
+            embed.add_field(
+                name="📊 Reason",
+                value=_trim_embed_value(scan_result.reason),
+                inline=False,
+            )
 
         if getattr(scan_result, "pipeline_steps", None):
             embed.add_field(
@@ -398,7 +454,7 @@ class AutoMod(commands.Cog):
 
         if message.content:
             embed.add_field(
-                name="💬 Message",
+                name="💬 Message Content",
                 value=_trim_embed_value(message.content),
                 inline=False,
             )
@@ -410,14 +466,80 @@ class AutoMod(commands.Cog):
                 lines.append(f"[{fname}]({url}){size_str}")
             embed.add_field(name="📎 Attachments", value=_trim_embed_value("\n".join(lines)), inline=False)
 
-        embed.set_footer(text="NSFW Detection System • Local AI Pipeline")
+        embed.set_footer(text="NSFW Detection System • Local AI Pipeline | Use buttons below to submit feedback")
 
-        view = None
+        # ── Build combined view: RemoveTimeout + Feedback buttons ─────────────
+        # Serialize scan data for the feedback view to store on click
+        try:
+            model_scores = _extract_model_scores(scan_result)
+            scan_result_payload = json.dumps({
+                "branch": scan_result.branch,
+                "model": scan_result.model,
+                "processing_time_ms": scan_result.processing_time_ms,
+                "model_scores": model_scores,
+                "detected_tags": _extract_detected_tags(scan_result),
+            })
+        except Exception:
+            scan_result_payload = "{}"
+
+        feedback_view = ModerationFeedbackView(
+            message_id=str(message.id),
+            user_id=str(member.id),
+            channel_id=str(message.channel.id),
+            guild_id=str(message.guild.id),
+            predicted_verdict=scan_result.verdict,
+            scan_result_json=scan_result_payload,
+        )
+
+        # If there's also a timeout-removal button, we inject it into the feedback view
         if verdict == "BLOCK" and cfg.get("punishment") == "timeout":
-            view = RemoveTimeoutView(member.id)
+            # Add the remove-timeout button to the feedback view
+            remove_btn = discord.ui.Button(
+                label="Remove Timeout",
+                style=discord.ButtonStyle.success,
+                emoji="✅",
+                custom_id=f"remove_timeout_{member.id}",
+                row=1,
+            )
+
+            async def _remove_timeout_callback(interaction: discord.Interaction) -> None:
+                try:
+                    if not interaction.user.guild_permissions.moderate_members:
+                        return await interaction.response.send_message(
+                            "❌ You don't have permission to do this!", ephemeral=True
+                        )
+                    target_member = interaction.guild.get_member(member.id)
+                    if not target_member:
+                        return await interaction.response.send_message(
+                            "❌ User not found in server!", ephemeral=True
+                        )
+                    await target_member.timeout(None, reason=f"Timeout removed by {interaction.user.name}")
+                    original_embed = interaction.message.embeds[0]
+                    original_embed.add_field(
+                        name="⚠️ Timeout Status",
+                        value=f"**Removed by:** {interaction.user.mention}\n"
+                              f"**At:** <t:{int(discord.utils.utcnow().timestamp())}:F>",
+                        inline=False,
+                    )
+                    original_embed.color = 0x808080
+                    remove_btn.disabled = True
+                    remove_btn.label = "Timeout Removed"
+                    remove_btn.style = discord.ButtonStyle.gray
+                    await interaction.response.edit_message(embed=original_embed, view=feedback_view)
+                    await interaction.followup.send(
+                        f"✅ Removed timeout from {target_member.mention}", ephemeral=True
+                    )
+                except Exception as e:
+                    logger.error("Failed to remove timeout: %s", e)
+                    await interaction.response.send_message(
+                        f"❌ Failed to remove timeout: {e}", ephemeral=True
+                    )
+
+            remove_btn.callback = _remove_timeout_callback
+            feedback_view.add_item(remove_btn)
 
         try:
-            log_msg = await log_channel.send(embed=embed, view=view)
+            log_msg = await log_channel.send(embed=embed, view=feedback_view)
         except discord.HTTPException as e:
             logger.error("Failed to send rich NSFW log embed; sending compact fallback: %s", e)
             fallback = discord.Embed(
@@ -433,7 +555,7 @@ class AutoMod(commands.Cog):
                     f"**Model:** `{scan_result.model}`"
                 ),
             )
-            log_msg = await log_channel.send(embed=fallback)
+            log_msg = await log_channel.send(embed=fallback, view=feedback_view)
 
         # Send image preview as spoiler
         if file_info:
@@ -548,11 +670,53 @@ class AutoMod(commands.Cog):
             )
 
             # Set image preview
+            preview_file = None
             if any(fname.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")):
-                embed.set_image(url=url)
+                if scan_result.verdict == "SAFE":
+                    embed.set_image(url=url)
+                else:
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                if resp.status == 200:
+                                    data = await resp.read()
+                                    safe_fname = fname if fname.upper().startswith("SPOILER_") else f"SPOILER_{fname}"
+                                    preview_file = discord.File(
+                                        fp=BytesIO(data),
+                                        filename=safe_fname,
+                                        spoiler=True,
+                                    )
+                                    embed.set_image(url=f"attachment://{safe_fname}")
+                    except Exception as e:
+                        logger.debug("Could not download debug image for spoiler: %s", e)
 
-            embed.set_footer(text="NSFW Bot Debugging Logger • Local Inference")
-            await debug_channel.send(embed=embed)
+            # ── Build feedback buttons view ───────────────────────────────────
+            try:
+                model_scores = _extract_model_scores(scan_result)
+                scan_result_payload = json.dumps({
+                    "branch": scan_result.branch,
+                    "model": scan_result.model,
+                    "processing_time_ms": scan_result.processing_time_ms,
+                    "model_scores": model_scores,
+                    "detected_tags": _extract_detected_tags(scan_result),
+                })
+            except Exception:
+                scan_result_payload = "{}"
+
+            feedback_view = ModerationFeedbackView(
+                message_id=str(message.id),
+                user_id=str(member.id),
+                channel_id=str(message.channel.id),
+                guild_id=str(message.guild.id),
+                predicted_verdict=scan_result.verdict,
+                scan_result_json=scan_result_payload,
+            )
+
+            embed.set_footer(text="NSFW Bot Debugging Logger • Local Inference | Use buttons below to submit feedback")
+            if preview_file:
+                await debug_channel.send(embed=embed, file=preview_file, view=feedback_view)
+            else:
+                await debug_channel.send(embed=embed, view=feedback_view)
         except Exception as e:
             logger.error("Failed to send debug log embed: %s", e, exc_info=True)
 

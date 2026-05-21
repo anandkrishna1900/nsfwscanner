@@ -294,6 +294,111 @@ class NSFWAdminCog(commands.Cog):
             await interaction.followup.send(f"❌ Scan failed: {e}", ephemeral=True)
 
 
+    # ── /nsfw feedback-stats ──────────────────────────────────────────────────
+
+    @nsfw_group.command(
+        name="feedback-stats",
+        description="Show moderator feedback statistics and model accuracy estimates",
+    )
+    @_has_manage_messages()
+    async def nsfw_feedback_stats(self, interaction: discord.Interaction) -> None:
+        """Display active-learning feedback statistics for this guild."""
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            from utils.database import get_feedback_stats
+
+            guild_id = str(interaction.guild_id)
+            stats = await get_feedback_stats(guild_id)
+
+            total = stats["total_logged"]
+
+            if total == 0:
+                embed = discord.Embed(
+                    title="📊 Moderator Feedback Stats",
+                    description=(
+                        "No feedback has been submitted yet for this server.\n\n"
+                        "Use the **✅ Correct Detection**, **❌ False Positive**, "
+                        "and **⚠️ False Negative** buttons on moderation log embeds to collect data."
+                    ),
+                    color=0x6366F1,
+                    timestamp=discord.utils.utcnow(),
+                )
+                embed.set_footer(text="Active Learning Feedback System")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            # Color based on accuracy
+            accuracy = stats["accuracy"]
+            color = (
+                0x22C55E if accuracy >= 80
+                else 0xF59E0B if accuracy >= 60
+                else 0xEF4444
+            )
+
+            embed = discord.Embed(
+                title="📊 Moderator Feedback Stats",
+                description=(
+                    f"Based on **{total}** moderator feedback submissions for this server.\n"
+                    f"This data is used to calibrate future ML model improvements."
+                ),
+                color=color,
+                timestamp=discord.utils.utcnow(),
+            )
+
+            # Summary stats
+            embed.add_field(
+                name="📈 Feedback Summary",
+                value=(
+                    f"**Total Logged:** `{total}`\n"
+                    f"**✅ Correct:** `{stats['correct']}`\n"
+                    f"**❌ False Positives:** `{stats['false_positives']}`\n"
+                    f"**⚠️ False Negatives:** `{stats['false_negatives']}`"
+                ),
+                inline=True,
+            )
+
+            # Rate stats
+            embed.add_field(
+                name="📉 Error Rates",
+                value=(
+                    f"**FP Rate:** `{stats['fp_rate']}%`\n"
+                    f"**FN Rate:** `{stats['fn_rate']}%`\n"
+                    f"**Accuracy:** `{accuracy}%`\n"
+                ),
+                inline=True,
+            )
+
+            # Accuracy bar (emoji visualization)
+            filled = int(accuracy / 10)
+            bar = "🟩" * filled + "⬜" * (10 - filled)
+            embed.add_field(
+                name="🎯 Accuracy Bar",
+                value=f"{bar}\n`{accuracy}%` model precision",
+                inline=False,
+            )
+
+            # Top failed tags
+            top_tags = stats.get("top_failed_tags", [])
+            if top_tags:
+                tag_lines = [f"`{tag}` — **{count}** failures" for tag, count in top_tags[:8]]
+                embed.add_field(
+                    name="🔍 Most Commonly Misidentified Tags",
+                    value="\n".join(tag_lines),
+                    inline=False,
+                )
+
+            embed.set_footer(
+                text="Active Learning Feedback System • Data used for future ML calibration only"
+            )
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error("nsfw feedback-stats error: %s", e, exc_info=True)
+            await interaction.followup.send(f"❌ Error fetching stats: {e}", ephemeral=True)
+
+
 async def setup(bot: commands.Bot) -> None:
     cog = NSFWAdminCog(bot)
     await bot.add_cog(cog)

@@ -48,6 +48,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 from config import config
+from bot.ui.feedback_view import ModerationFeedbackView
 
 # ── Intents ───────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -94,6 +95,10 @@ async def on_ready() -> None:
     logger.info("✅ %s connected to Discord!", bot.user.name)
     logger.info("📊 Serving %d guild(s)", len(bot.guilds))
     logger.info("🔐 Message Content Intent: %s", intents.message_content)
+
+    # Register persistent views so buttons survive restarts
+    bot.add_view(ModerationFeedbackView())
+    logger.info("🔘 Registered persistent feedback view")
 
     # Sync slash commands to configured guilds
     if config.guild_ids:
@@ -175,7 +180,9 @@ def _load_persisted_channels(cfg) -> None:
 async def main() -> None:
     bot.start_time = time.time()
 
-    # Initialize database (Removed, relying only on log channels per AGENTS.md)
+    # Initialize SQLite database for moderator feedback
+    from utils.database import init_db
+    await init_db(config.sqlite_db_path)
 
     # Merge channels persisted by /nsfw enable into live config
     _load_persisted_channels(config)
