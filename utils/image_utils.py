@@ -11,6 +11,8 @@ import os
 from typing import Optional
 
 import aiohttp
+import numpy as np
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -89,3 +91,63 @@ def guess_extension(filename: str, content_type: Optional[str] = None) -> str:
                 return ext
 
     return ".jpg"
+
+
+def prepare_image_for_onnx(
+    image: Image.Image,
+    target_size: int,
+    normalize_imagenet: bool = False,
+    to_chw: bool = False,
+    to_bgr: bool = False,
+) -> np.ndarray:
+    """
+    Robust preprocessing for ONNX models:
+    - Handles RGBA transparency by alpha compositing onto a white background.
+    - Pads the image to a square while preserving aspect ratio (avoids stretching/distortion).
+    - Resizes to target_size using PIL.Image.BICUBIC.
+    - Converts to a float32 numpy array normalized to [0.0, 1.0].
+    - Optionally swaps RGB to BGR channels.
+    - Optionally applies ImageNet normalization (mean and std).
+    - Optionally transposes from HWC to CHW format.
+    - Returns a 4D tensor with batch dimension (shape [1, C, H, W] or [1, H, W, C]).
+    """
+    # 1. Handle transparency
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        canvas = Image.new("RGBA", image.size, (255, 255, 255))
+        canvas.alpha_composite(image.convert("RGBA"))
+        img = canvas.convert("RGB")
+    else:
+        img = image.convert("RGB")
+
+    # 2. Pad to square preserving aspect ratio
+    w, h = img.size
+    max_dim = max(w, h)
+    pad_left = (max_dim - w) // 2
+    pad_top = (max_dim - h) // 2
+
+    padded_img = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
+    padded_img.paste(img, (pad_left, pad_top))
+
+    # 3. Resize to target_size
+    if max_dim != target_size:
+        padded_img = padded_img.resize((target_size, target_size), Image.BICUBIC)
+
+    # 4. Convert to float32 numpy array [0.0, 1.0]
+    arr = np.array(padded_img, dtype=np.float32) / 255.0
+
+    # 5. Swap RGB to BGR if requested
+    if to_bgr:
+        arr = arr[:, :, ::-1]
+
+    # 6. Apply ImageNet normalization if requested
+    if normalize_imagenet:
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = (arr - mean) / std
+
+    # 7. Transpose to CHW if requested
+    if to_chw:
+        arr = arr.transpose(2, 0, 1)
+
+    # 8. Add batch dimension
+    return np.expand_dims(arr, axis=0).copy()

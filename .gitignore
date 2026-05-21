@@ -16,9 +16,8 @@ Thumbs.db
 .idea/
 
 # Project specific data and models
-.env
-.env.local
-.env.*.local
+
+
 models/
 model_cache/
 .cache/

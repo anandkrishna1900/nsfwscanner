@@ -38,7 +38,6 @@ class ContentTypeRouter:
         # Labels: index 0 = anime/illustration, index 1 = real/photo
         # (will be confirmed from model metadata if available)
         self._labels: list[str] = ["anime", "real"]
-        self._load()
 
     def _load(self) -> None:
         """Download and load the deepghs/anime_real_cls ONNX model."""
@@ -102,16 +101,13 @@ class ContentTypeRouter:
 
     def _preprocess(self, image: Image.Image) -> np.ndarray:
         """Resize and normalize the image to the model's expected input."""
-        img = image.convert("RGB").resize(
-            (self._input_size, self._input_size), Image.BICUBIC
+        from utils.image_utils import prepare_image_for_onnx
+        return prepare_image_for_onnx(
+            image,
+            target_size=self._input_size,
+            normalize_imagenet=True,
+            to_chw=True,
         )
-        arr = np.array(img, dtype=np.float32) / 255.0
-        # ImageNet normalization
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        arr = (arr - mean) / std
-        arr = arr.transpose(2, 0, 1)           # HWC → CHW
-        return np.expand_dims(arr, axis=0)     # → NCHW
 
     def route(self, image: Image.Image) -> Tuple[str, float]:
         """
@@ -121,8 +117,11 @@ class ContentTypeRouter:
             (label, confidence) where label is "real" | "anime" | "uncertain"
         """
         if self._session is None:
-            logger.error("[Gatekeeper] Session not initialized — routing uncertain")
-            return ("uncertain", 0.0)
+            try:
+                self._load()
+            except Exception as e:
+                logger.error("[Gatekeeper] Failed to load session dynamically: %s — routing uncertain", e)
+                return ("uncertain", 0.0)
 
         inp = self._preprocess(image)
 

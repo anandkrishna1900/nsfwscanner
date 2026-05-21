@@ -242,7 +242,7 @@ class NSFWAdminCog(commands.Cog):
             from config import config as bot_config
             from moderation.pipeline import scan_attachment
 
-            result = await scan_attachment(attachment.url, bot_config)
+            result = await scan_attachment(attachment.url, bot_config, bypass_prefilter=True)
 
             verdict_emoji = {"BLOCK": "🚨", "REVIEW": "⚠️", "SAFE": "✅"}.get(result.verdict, "❓")
             color = {"BLOCK": 0xFF4444, "REVIEW": 0xFFA500, "SAFE": 0x22C55E}.get(result.verdict, 0x888888)
@@ -260,6 +260,17 @@ class NSFWAdminCog(commands.Cog):
             embed.add_field(name="Processing Time", value=f"{result.processing_time_ms:.0f}ms", inline=True)
             if result.frame_index is not None:
                 embed.add_field(name="Triggered Frame", value=f"#{result.frame_index}", inline=True)
+
+            if getattr(result, "pipeline_steps", None):
+                steps_text = "\n\n".join(result.pipeline_steps)
+                if len(steps_text) > 980:
+                    steps_text = steps_text[:980] + "\n... [Trace truncated due to character limit]"
+                embed.add_field(
+                    name="📋 AI Model Council Verification Trace",
+                    value=f"```yaml\n{steps_text}\n```",
+                    inline=False,
+                )
+
             embed.set_footer(text="Test mode — no action was taken regardless of verdict")
 
             await interaction.followup.send(embed=embed, ephemeral=True)

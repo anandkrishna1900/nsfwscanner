@@ -35,6 +35,7 @@ class BotConfig:
     monitor_all: bool                      # True if MONITORED_CHANNELS="all"
     log_channel_id: Optional[int]
     admin_role_id: Optional[int]
+    debug_log_channel_id: Optional[int]
 
     # ── AI Model Config ───────────────────────────────────────────────────────
     model_cache_dir: str
@@ -69,6 +70,9 @@ class BotConfig:
         admin_role_raw = os.getenv("ADMIN_ROLE_ID", "").strip()
         admin_role_id = int(admin_role_raw) if admin_role_raw.isdigit() else None
 
+        debug_log_channel_raw = os.getenv("DEBUG_LOG_CHANNEL_ID", "").strip()
+        debug_log_channel_id = int(debug_log_channel_raw) if debug_log_channel_raw.isdigit() else None
+
         return cls(
             discord_token=token.strip(),
             prefix=os.getenv("PREFIX", ";"),
@@ -77,6 +81,7 @@ class BotConfig:
             monitor_all=monitor_all,
             log_channel_id=log_channel_id,
             admin_role_id=admin_role_id,
+            debug_log_channel_id=debug_log_channel_id,
             model_cache_dir=os.getenv("MODEL_CACHE_DIR", "./models"),
             device=os.getenv("DEVICE", "cuda").lower(),
             max_video_size_mb=int(os.getenv("MAX_VIDEO_SIZE_MB", "50")),

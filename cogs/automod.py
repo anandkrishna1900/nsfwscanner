@@ -239,11 +239,16 @@ class AutoMod(commands.Cog):
         cfg: dict,
     ) -> None:
         """Send a detailed log embed to the configured log channel."""
-        log_channel_id = cfg.get("log_channel")
+        log_channel_id = bot_config.log_channel_id or cfg.get("log_channel")
         if not log_channel_id:
             return
 
         log_channel = message.guild.get_channel(int(log_channel_id))
+        if not log_channel:
+            try:
+                log_channel = await message.guild.fetch_channel(int(log_channel_id))
+            except Exception:
+                pass
         if not log_channel:
             return
 
@@ -281,7 +286,7 @@ class AutoMod(commands.Cog):
 
         # AI detection info
         embed.add_field(
-            name="🤖 AI Detection",
+            name="🤖 AI Detection Summary",
             value=(
                 f"**Verdict:** `{scan_result.verdict}`\n"
                 f"**Reason:** {scan_result.reason}\n"
@@ -292,6 +297,16 @@ class AutoMod(commands.Cog):
             ),
             inline=False,
         )
+
+        if getattr(scan_result, "pipeline_steps", None):
+            steps_text = "\n\n".join(scan_result.pipeline_steps)
+            if len(steps_text) > 980:
+                steps_text = steps_text[:980] + "\n... [Trace truncated due to character limit]"
+            embed.add_field(
+                name="📋 AI Model Council Verification Trace",
+                value=f"```yaml\n{steps_text}\n```",
+                inline=False,
+            )
 
         if message.content:
             embed.add_field(
@@ -335,6 +350,103 @@ class AutoMod(commands.Cog):
                             await log_channel.send(embed=preview_embed, file=preview_file)
             except Exception as e:
                 logger.debug("Could not send image preview: %s", e)
+
+    async def _send_debug_log_embed(
+        self,
+        message: discord.Message,
+        scan_result,
+        url: str,
+        fname: str,
+        size: int,
+    ) -> None:
+        """Send a detailed debug log embed with statistics for EVERY scan."""
+        try:
+            debug_channel_id = bot_config.debug_log_channel_id
+            if not debug_channel_id:
+                return
+
+            debug_channel = self.bot.get_channel(debug_channel_id)
+            if not debug_channel:
+                try:
+                    debug_channel = await self.bot.fetch_channel(debug_channel_id)
+                except Exception:
+                    pass
+            if not debug_channel:
+                return
+
+            member = message.author
+            now = discord.utils.utcnow()
+
+            # Choose color based on verdict
+            color_map = {
+                "SAFE": 0x22C55E,    # Green
+                "REVIEW": 0xF59E0B,  # Orange
+                "BLOCK": 0xEF4444,   # Red
+            }
+            color = color_map.get(scan_result.verdict, 0x888888)
+
+            verdict_emoji = {
+                "SAFE": "✅ SAFE",
+                "REVIEW": "⚠️ REVIEW NEEDED",
+                "BLOCK": "🚨 BLOCKED",
+            }.get(scan_result.verdict, "❓ UNKNOWN")
+
+            embed = discord.Embed(
+                title=f"🔍 Scan Debug Stats — {verdict_emoji}",
+                color=color,
+                timestamp=now
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+
+            # Basic metadata
+            embed.add_field(name="👤 User", value=f"{member.mention}\n`{member.id}`", inline=True)
+            embed.add_field(name="📺 Channel", value=message.channel.mention, inline=True)
+            embed.add_field(name="💬 Message ID", value=f"`{message.id}`", inline=True)
+
+            # AI Stats
+            embed.add_field(
+                name="🧠 AI Council Engine",
+                value=(
+                    f"**Verdict:** `{scan_result.verdict}`\n"
+                    f"**Engine/Model:** `{scan_result.model}`\n"
+                    f"**Active Branch:** `{scan_result.branch}`\n"
+                    f"**Processing Time:** `{scan_result.processing_time_ms:.1f}ms`"
+                ),
+                inline=False
+            )
+
+            embed.add_field(
+                name="📊 Details & Confidence",
+                value=f"```\n{scan_result.reason}\n```",
+                inline=False
+            )
+
+            if getattr(scan_result, "pipeline_steps", None):
+                steps_text = "\n\n".join(scan_result.pipeline_steps)
+                if len(steps_text) > 980:
+                    steps_text = steps_text[:980] + "\n... [Trace truncated due to character limit]"
+                embed.add_field(
+                    name="📋 AI Model Council Verification Trace",
+                    value=f"```yaml\n{steps_text}\n```",
+                    inline=False,
+                )
+
+            # File Info
+            size_str = f"{size:,} bytes" if size else "Unknown"
+            embed.add_field(
+                name="📎 Media Info",
+                value=f"**Name:** `{fname}`\n**Size:** `{size_str}`\n**Link:** [Open original file]({url})",
+                inline=False
+            )
+
+            # Set image preview
+            if any(fname.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                embed.set_image(url=url)
+
+            embed.set_footer(text="NSFW Bot Debugging Logger • Local Inference")
+            await debug_channel.send(embed=embed)
+        except Exception as e:
+            logger.error("Failed to send debug log embed: %s", e, exc_info=True)
 
     # ── Main listener ─────────────────────────────────────────────────────────
 
@@ -398,6 +510,10 @@ class AutoMod(commands.Cog):
                         result.reason,
                     )
 
+                    # Send to debug channel if configured, even if SAFE
+                    if bot_config.debug_log_channel_id:
+                        await self._send_debug_log_embed(message, result, url, fname, size)
+
                     if best_result is None or _SEVERITY.get(result.verdict, 0) > _SEVERITY.get(best_result.verdict, 0):
                         best_result = result
                         best_file_info = [(url, fname, size)]
@@ -454,9 +570,15 @@ class AutoMod(commands.Cog):
             cfg = self.get_server_config(ctx.guild.id)
             status = "🟢 Enabled" if cfg["enabled"] else "🔴 Disabled"
 
+            log_channel_id = bot_config.log_channel_id or cfg.get("log_channel")
             log_channel = None
-            if cfg["log_channel"]:
-                log_channel = ctx.guild.get_channel(int(cfg["log_channel"]))
+            if log_channel_id:
+                log_channel = ctx.guild.get_channel(int(log_channel_id))
+                if not log_channel:
+                    try:
+                        log_channel = await ctx.guild.fetch_channel(int(log_channel_id))
+                    except Exception:
+                        pass
 
             channels = cfg.get("channels", [])
             if channels:

@@ -85,12 +85,13 @@ class AdamCoddPrefilter:
 
     def _preprocess(self, image: Image.Image) -> np.ndarray:
         """Resize, normalize, and convert image to float32 NCHW numpy array."""
-        img = image.convert("RGB").resize((_INPUT_SIZE, _INPUT_SIZE), Image.BICUBIC)
-        arr = np.array(img, dtype=np.float32) / 255.0          # HWC, [0,1]
-        arr = (arr - _MEAN) / _STD                              # normalize
-        arr = arr.transpose(2, 0, 1)                            # HWC → CHW
-        arr = np.expand_dims(arr, axis=0)                       # CHW → NCHW
-        return arr
+        from utils.image_utils import prepare_image_for_onnx
+        return prepare_image_for_onnx(
+            image,
+            target_size=_INPUT_SIZE,
+            normalize_imagenet=True,
+            to_chw=True,
+        )
 
     def score(self, image: Image.Image) -> float:
         """

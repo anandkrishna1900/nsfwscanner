@@ -12,7 +12,7 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 import aiohttp
@@ -34,6 +34,7 @@ class ScanResult:
     model: str                             # which model made the final call
     frame_index: Optional[int]            # which frame triggered it (None for images)
     processing_time_ms: float
+    pipeline_steps: list[str] = field(default_factory=list)
 
 
 # ── Module-level singletons (lazy init) ───────────────────────────────────────
@@ -149,6 +150,7 @@ def _severity(verdict: str) -> int:
 async def scan_attachment(
     attachment_url: str,
     config: "BotConfig",
+    bypass_prefilter: bool = False,
 ) -> ScanResult:
     """
     Full pipeline: download → frame extraction → prefilter → gatekeeper → branch(es) → verdict.
@@ -183,6 +185,11 @@ async def scan_attachment(
                 model="none",
                 frame_index=None,
                 processing_time_ms=elapsed,
+                pipeline_steps=[
+                    "Limit Check:\n"
+                    "  Status: Rejected\n"
+                    f"  Reason: {str(e)}"
+                ]
             )
         except Exception as e:
             logger.warning("[Pipeline] Download failed for %s: %s", attachment_url, e)
@@ -194,6 +201,11 @@ async def scan_attachment(
                 model="none",
                 frame_index=None,
                 processing_time_ms=elapsed,
+                pipeline_steps=[
+                    "Download Stage:\n"
+                    "  Status: Failed\n"
+                    f"  Error: {str(e)}"
+                ]
             )
 
         # ── Frame extraction ──────────────────────────────────────────────────
@@ -219,6 +231,11 @@ async def scan_attachment(
                 model="none",
                 frame_index=None,
                 processing_time_ms=elapsed,
+                pipeline_steps=[
+                    "Frame Extraction Stage:\n"
+                    "  Status: Rejected\n"
+                    f"  Reason: {str(e)}"
+                ]
             )
 
         if not frames:
@@ -230,6 +247,11 @@ async def scan_attachment(
                 model="none",
                 frame_index=None,
                 processing_time_ms=elapsed,
+                pipeline_steps=[
+                    "Frame Extraction Stage:\n"
+                    "  Status: Failed\n"
+                    "  Reason: Zero frames could be parsed from media"
+                ]
             )
 
         logger.info("[Pipeline] Processing %d frame(s) from %s", len(frames), attachment_url)
@@ -238,15 +260,55 @@ async def scan_attachment(
         best_result: Optional[ScanResult] = None
 
         for frame_idx, frame in enumerate(frames):
+            steps = []
+            w, h = frame.size
+
             # Stage 0: Pre-filter
-            worth_checking = await asyncio.to_thread(_run_prefilter, frame)
+            prefilter_score = await asyncio.to_thread(_prefilter.score, frame)
+            worth_checking = prefilter_score >= 0.25 or bypass_prefilter
+
+            verdict_text = "Passed to Gatekeeper Router"
+            if not (prefilter_score >= 0.25):
+                if bypass_prefilter:
+                    verdict_text = "Passed to Gatekeeper Router (Forced via Test Mode)"
+                else:
+                    verdict_text = "Approved (SAFE) - Skipping deeper analysis"
+
+            steps.append(
+                f"Stage 0: Pre-filter\n"
+                f"  Model: AdamCodd/vit-base-nsfw-detector (ONNX CPU)\n"
+                f"  Resolution: {w}x{h}\n"
+                f"  NSFW Score: {prefilter_score:.4f}\n"
+                f"  Threshold: 0.25\n"
+                f"  Verdict: {verdict_text}"
+            )
+
             if not worth_checking:
                 logger.debug("[Pipeline] Frame %d skipped by prefilter", frame_idx)
+                frame_scan = ScanResult(
+                    verdict="SAFE",
+                    reason=f"Cleared prefilter (score={prefilter_score:.4f})",
+                    branch="prefilter_skip",
+                    model="prefilter",
+                    frame_index=frame_idx if len(frames) > 1 else None,
+                    processing_time_ms=0,
+                    pipeline_steps=steps
+                )
+                if best_result is None or _severity(frame_scan.verdict) > _severity(best_result.verdict):
+                    best_result = frame_scan
                 continue
 
             # Stage 1: Gatekeeper
             route, confidence = await asyncio.to_thread(_run_gatekeeper, frame)
             logger.debug("[Pipeline] Frame %d → route=%s (%.2f)", frame_idx, route, confidence)
+
+            steps.append(
+                f"Stage 1: Gatekeeper Router\n"
+                f"  Model: deepghs/anime_real_cls (ONNX CPU)\n"
+                f"  Classification: {route}\n"
+                f"  Confidence: {confidence:.2f}\n"
+                f"  Action: " + ("Routed to Real/Photo Branch" if route == "real" else "Routed to Anime/Illustration Branch" if route == "anime" else "Uncertain - Routing to BOTH branches")
+            )
 
             # Stage 2: Branch(es)
             if route == "real":
@@ -254,10 +316,39 @@ async def scan_attachment(
                 branch_name = "real"
                 model_name = branch_result.model
 
+                detections_str = "None found"
+                if branch_result.detections:
+                    detections_str = "\n" + "\n".join(f"    - {label}: {score:.2f}" for label, score, _ in branch_result.detections)
+
+                steps.append(
+                    f"Stage 2A: Real/Photo Branch\n"
+                    f"  Model: NudeNet v3 (ONNX CPU)\n"
+                    f"  Target Explicit Labels: FEMALE_GENITALIA_EXPOSED, MALE_GENITALIA_EXPOSED, ANUS_EXPOSED, FEMALE_BREAST_EXPOSED\n"
+                    f"  Detected Explicit Labels: {detections_str}\n"
+                    f"  Verdict: {branch_result.verdict}"
+                )
+
             elif route == "anime":
                 branch_result = await asyncio.to_thread(_run_anime_branch, frame)
                 branch_name = "anime"
                 model_name = branch_result.model
+
+                tags_str = "None found"
+                if branch_result.detections:
+                    tags_str = "\n" + "\n".join(f"    - {tag}: {score:.2f}" for tag, score, _ in branch_result.detections)
+
+                secondary_consulted = "No (Borderline criteria not met)"
+                if branch_result.model == "anime_rating":
+                    secondary_consulted = "Yes (deepghs/anime_rating returned r18)"
+
+                steps.append(
+                    f"Stage 2B: Anime/Hentai Branch\n"
+                    f"  Primary Model: SmilingWolf/wd-vit-large-tagger-v3 (ONNX CPU)\n"
+                    f"  Tagger Rating: {getattr(branch_result, 'rating', 'unknown')}\n"
+                    f"  Detected Explicit Tags: {tags_str}\n"
+                    f"  Secondary Check: {secondary_consulted}\n"
+                    f"  Verdict: {branch_result.verdict}"
+                )
 
             else:
                 # Uncertain: run both, take higher severity
@@ -272,6 +363,31 @@ async def scan_attachment(
                     branch_name = "anime"
                 model_name = branch_result.model
 
+                real_detections_str = "None found"
+                if real_res.detections:
+                    real_detections_str = "\n" + "\n".join(f"      - {label}: {score:.2f}" for label, score, _ in real_res.detections)
+
+                anime_tags_str = "None found"
+                if anime_res.detections:
+                    anime_tags_str = "\n" + "\n".join(f"      - {tag}: {score:.2f}" for tag, score, _ in anime_res.detections)
+
+                steps.append(
+                    f"Stage 2: Uncertain (Both Branches Evaluated)\n"
+                    f"  Real/Photo Branch:\n"
+                    f"    Model: NudeNet v3 (ONNX CPU)\n"
+                    f"    Detections: {real_detections_str}\n"
+                    f"    Verdict: {real_res.verdict}\n"
+                    f"  Anime/Illustration Branch:\n"
+                    f"    Model: SmilingWolf/wd-vit-large-tagger-v3 (ONNX CPU)\n"
+                    f"    Tagger Rating: {getattr(anime_res, 'rating', 'unknown')}\n"
+                    f"    Detected Explicit Tags: {anime_tags_str}\n"
+                    f"    Verdict: {anime_res.verdict}\n"
+                    f"  Decision Policy: Chosen higher severity verdict\n"
+                    f"  Selected Branch: {branch_name}\n"
+                    f"  Final Model: {model_name}\n"
+                    f"  Verdict: {branch_result.verdict}"
+                )
+
             # Build ScanResult for this frame
             reason = _build_reason(branch_result)
             frame_scan = ScanResult(
@@ -281,6 +397,7 @@ async def scan_attachment(
                 model=model_name,
                 frame_index=frame_idx if len(frames) > 1 else None,
                 processing_time_ms=0,
+                pipeline_steps=steps
             )
 
             # Track best result
@@ -307,6 +424,11 @@ async def scan_attachment(
                 model="prefilter",
                 frame_index=None,
                 processing_time_ms=elapsed,
+                pipeline_steps=[
+                    "Pipeline Run:\n"
+                    "  Verdict: SAFE\n"
+                    "  Reason: All frames cleared prefilter"
+                ]
             )
 
         best_result.processing_time_ms = elapsed

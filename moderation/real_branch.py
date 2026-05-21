@@ -26,6 +26,7 @@ GENITAL_LABELS: dict[str, float] = {
     "MALE_GENITALIA_EXPOSED":   0.55,
     "ANUS_EXPOSED":             0.60,
     "MALE_GENITALIA_COVERED":   0.75,  # only when erection is clearly evident
+    "FEMALE_BREAST_EXPOSED":    0.55,  # exposed female breasts block policy
 }
 
 # REVIEW window: score in [threshold - REVIEW_OFFSET, threshold) → REVIEW
@@ -51,11 +52,14 @@ class RealBranch:
     """
 
     def __init__(self) -> None:
-        from nudenet import NudeDetector
-        self._detector = NudeDetector()
-        logger.info("[RealBranch] NudeDetector loaded")
+        self._detector = None
 
     def scan(self, image: Image.Image) -> BranchResult:
+        if self._detector is None:
+            from nudenet import NudeDetector
+            self._detector = NudeDetector()
+            logger.info("[RealBranch] NudeDetector loaded")
+
         """
         Scan a PIL Image for genital content using NudeNet.
 
@@ -74,7 +78,14 @@ class RealBranch:
             # ── 1. Save to temp file ──────────────────────────────────────────
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 tmp_path = tmp.name
-                image.convert("RGB").save(tmp_path, format="JPEG", quality=95)
+                # Alpha composite transparency on a white background
+                if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+                    canvas = Image.new("RGBA", image.size, (255, 255, 255))
+                    canvas.alpha_composite(image.convert("RGBA"))
+                    img_to_save = canvas.convert("RGB")
+                else:
+                    img_to_save = image.convert("RGB")
+                img_to_save.save(tmp_path, format="JPEG", quality=95)
 
             # ── 2. Run NudeNet ────────────────────────────────────────────────
             raw_detections: list[dict] = self._detector.detect(tmp_path)

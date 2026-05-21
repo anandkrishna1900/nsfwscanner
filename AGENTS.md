@@ -3,7 +3,7 @@
 
 ## Project Overview
 A locally-hosted Discord bot that automatically scans images, GIFs, and videos posted in
-configured channels for explicit genital content. It uses a council of specialized AI models
+configured channels for explicit genitals and exposed breasts/nudity. It uses a council of specialized AI models
 routed by a content-type classifier. No external APIs are used — all inference runs locally.
 
 ## Hardware Constraints — CRITICAL
@@ -82,7 +82,8 @@ nsfw-bot/
   - MALE_GENITALIA_EXPOSED   (threshold: 0.55)
   - ANUS_EXPOSED             (threshold: 0.60)
   - MALE_GENITALIA_COVERED   (threshold: 0.75 — only if erection is evident)
-- All other NudeNet labels (BREAST, BUTTOCKS, etc.) are IGNORED completely
+  - FEMALE_BREAST_EXPOSED    (threshold: 0.55 — block exposed female breasts)
+- All other NudeNet labels (BUTTOCKS, etc.) are IGNORED completely
 - Runtime: ONNX via nudenet's built-in runner on CPU (nudenet uses ONNX internally)
 
 ### Stage 2B: Anime/Hentai Branch (CPU via ONNX)
@@ -90,8 +91,8 @@ nsfw-bot/
 - HuggingFace: SmilingWolf/wd-vit-large-tagger-v3
 - Purpose: Tag anime content and output safe/sensitive/questionable/explicit rating
 - Runtime: onnxruntime CPUExecutionProvider (use the model.onnx file)
-- Block if: rating == "explicit" AND any of these tags score > 0.50:
-  - "penis", "vagina", "pussy", "genitals", "testicles", "erection"
+- Block if: (rating == "explicit" OR rating == "questionable") AND any of these explicit tags score > 0.50:
+  - "penis", "vagina", "pussy", "genitals", "testicles", "erection", "phallus", "anus", "nipples", "bare_breasts", "breasts_out"
 - Secondary check: deepghs/anime_rating
 - HuggingFace: deepghs/anime_rating
 - Purpose: R18 cross-confirmation (safe/r15/r18)
@@ -100,17 +101,17 @@ nsfw-bot/
 
 ### Stage 3: Verdict Aggregator
 Three tiers only:
-- BLOCK:  High confidence explicit genital content detected
-- REVIEW: One model flags genitals, confidence between threshold and threshold+0.15
+- BLOCK:  High confidence explicit genital or exposed breast content detected
+- REVIEW: One model flags genitals/breasts, confidence between threshold and threshold+0.15
 - SAFE:   Nothing flagged or confidence below threshold
 
-## Detection Rules — Genital-Only Policy
-This bot ONLY flags genital exposure. The following are explicitly NOT flagged:
-- Breasts (covered or exposed)
+## Detection Rules — Genitals & Exposed Breasts Block Policy
+This bot flags genital exposure and exposed female breasts/nipples. The following are explicitly NOT flagged (kept SAFE):
+- Covered breasts, cleavage (where nipples/bare breasts are not exposed)
 - Buttocks (covered or exposed)
-- Lingerie, bikinis, swimwear
-- Suggestive poses without exposure
-- Anime content rated "sensitive" or "questionable" without genital tags
+- Lingerie, bikinis, swimwear (as long as nipples are not exposed)
+- Suggestive poses without naked breast/genital exposure
+- Anime content rated "sensitive" or "questionable" without explicit genital/exposed breast tags
 
 ## Video and GIF Handling
 - Use imageio[ffmpeg] to extract frames
@@ -188,7 +189,7 @@ aiofiles>=23.0.0
 - Never hardcode the Discord token anywhere
 - Never load all models simultaneously
 - Never block the event loop — all inference must be in asyncio.to_thread()
-- Never flag or delete messages for breasts, buttocks, lingerie, or suggestive content
+- Never flag or delete messages for covered breasts, buttocks, lingerie, or suggestive content (flag exposed breasts/nipples and genitals only)
 - Never use API-based model inference (all local only)
 - Never store user images beyond the duration of a single inference call
 - Never log the actual image content — log metadata only (user ID, channel, timestamp, verdict)

@@ -19,8 +19,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ── Genital tag vocabulary ────────────────────────────────────────────────────
-GENITAL_TAGS: Set[str] = {
+# ── Explicit tag vocabulary ────────────────────────────────────────────────────
+EXPLICIT_TAGS: Set[str] = {
     "penis",
     "vagina",
     "pussy",
@@ -28,10 +28,14 @@ GENITAL_TAGS: Set[str] = {
     "testicles",
     "erection",
     "phallus",
+    "nipples",
+    "bare_breasts",
+    "breasts_out",
+    "anus",
 }
 
-GENITAL_TAG_THRESHOLD: float = 0.50
-GENITAL_TAG_REVIEW_LOW: float = 0.35  # borderline window for secondary check
+EXPLICIT_TAG_THRESHOLD: float = 0.50
+EXPLICIT_TAG_REVIEW_LOW: float = 0.35  # borderline window for secondary check
 
 # WDv3 input size
 _WDV3_INPUT_SIZE: int = 448
@@ -66,8 +70,6 @@ class AnimeBranch:
         self._wdv3_output_name: Optional[str] = None
         self._rating_input_name: Optional[str] = None
         self._rating_output_name: Optional[str] = None
-        self._load_wdv3()
-        self._load_anime_rating()
 
     # ── Loaders ───────────────────────────────────────────────────────────────
 
@@ -174,23 +176,24 @@ class AnimeBranch:
         WDv3 expects: RGB, resized to 448×448, values in [0,1], channels-last (NHWC).
         Note: WDv3 uses BGR order internally — convert RGB→BGR before returning.
         """
-        img = image.convert("RGB").resize((_WDV3_INPUT_SIZE, _WDV3_INPUT_SIZE), Image.BICUBIC)
-        arr = np.array(img, dtype=np.float32) / 255.0  # HWC RGB, [0,1]
-        # WDv3 was trained with BGR input
-        arr = arr[:, :, ::-1].copy()                   # RGB → BGR
-        # Pad to square (model expects specific aspect ratio)
-        arr = np.expand_dims(arr, axis=0)              # NHWC
-        return arr
+        from utils.image_utils import prepare_image_for_onnx
+        return prepare_image_for_onnx(
+            image,
+            target_size=_WDV3_INPUT_SIZE,
+            to_bgr=True,
+            to_chw=False,
+            normalize_imagenet=False,
+        )
 
     def _preprocess_rating(self, image: Image.Image) -> np.ndarray:
         """Preprocess for deepghs/anime_rating (standard ImageNet normalization, NCHW)."""
-        img = image.convert("RGB").resize((224, 224), Image.BICUBIC)
-        arr = np.array(img, dtype=np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        arr = (arr - mean) / std
-        arr = arr.transpose(2, 0, 1)
-        return np.expand_dims(arr, axis=0)
+        from utils.image_utils import prepare_image_for_onnx
+        return prepare_image_for_onnx(
+            image,
+            target_size=224,
+            normalize_imagenet=True,
+            to_chw=True,
+        )
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -227,17 +230,17 @@ class AnimeBranch:
                         best_rating_score = scores[idx]
                         rating = short_rating
 
-        # Extract genital tag scores
-        genital_scores: Dict[str, float] = {}
+        # Extract explicit tag scores
+        explicit_scores: Dict[str, float] = {}
         for i, tag in enumerate(self._tag_names):
-            if tag.lower() in GENITAL_TAGS and i < len(scores):
+            if tag.lower() in EXPLICIT_TAGS and i < len(scores):
                 s = float(scores[i])
-                if s > GENITAL_TAG_REVIEW_LOW:
-                    genital_scores[tag] = s
+                if s > EXPLICIT_TAG_REVIEW_LOW:
+                    explicit_scores[tag] = s
                     logger.debug("[AnimeBranch] Tag %s = %.3f", tag, s)
 
         logger.debug("[AnimeBranch] WDv3 rating=%s (%.3f)", rating, best_rating_score)
-        return rating, genital_scores
+        return rating, explicit_scores
 
     def _run_anime_rating(self, image: Image.Image) -> str:
         """
@@ -245,7 +248,11 @@ class AnimeBranch:
         Returns "safe", "r15", or "r18".
         """
         if self._rating_session is None:
-            return "safe"
+            try:
+                self._load_anime_rating()
+            except Exception as e:
+                logger.error("[AnimeBranch] Failed to load deepghs/anime_rating dynamically: %s", e)
+                return "safe"
 
         try:
             inp = self._preprocess_rating(image)
@@ -274,30 +281,34 @@ class AnimeBranch:
 
     def scan(self, image: Image.Image) -> BranchResult:
         """
-        Scan an anime/illustration image for explicit genital content.
+        Scan an anime/illustration image for explicit content (genitals and exposed breasts).
 
         Decision logic:
-        - BLOCK: WDv3 rating == "explicit" AND any GENITAL_TAG > 0.50
-        - REVIEW: WDv3 rating == "explicit" but no genital tags > 0.50
-                  OR WDv3 "questionable" with genital tags 0.35–0.50 and anime_rating == "r18"
+        - BLOCK: WDv3 rating in ("explicit", "questionable") AND any EXPLICIT_TAGS > 0.50
+        - REVIEW: WDv3 rating == "explicit" but no explicit tags > 0.50
+                  OR WDv3 "questionable" with explicit tags 0.35–0.50 and anime_rating == "r18"
         - SAFE:  Anything else (sensitive/questionable alone does NOT trigger)
         """
         if self._wdv3_session is None:
-            logger.error("[AnimeBranch] WDv3 session not loaded")
-            return BranchResult(verdict="SAFE")
+            try:
+                self._load_wdv3()
+            except Exception as e:
+                logger.error("[AnimeBranch] Failed to load WDv3 tagger dynamically: %s", e)
+                return BranchResult(verdict="SAFE")
 
         try:
-            rating, genital_scores = self._run_wdv3(image)
+            rating, explicit_scores = self._run_wdv3(image)
 
-            max_score = max(genital_scores.values()) if genital_scores else 0.0
-            detections = [(tag, score, None) for tag, score in genital_scores.items()]
+            max_score = max(explicit_scores.values()) if explicit_scores else 0.0
+            detections = [(tag, score, None) for tag, score in explicit_scores.items()]
 
-            if rating == "explicit":
-                high_confidence = {t: s for t, s in genital_scores.items() if s > GENITAL_TAG_THRESHOLD}
+            # 1. BLOCK: rating in ("explicit", "questionable") and any explicit tag > 0.50
+            if rating in ("explicit", "questionable"):
+                high_confidence = {t: s for t, s in explicit_scores.items() if s > EXPLICIT_TAG_THRESHOLD}
                 if high_confidence:
-                    # BLOCK
                     logger.info(
-                        "[AnimeBranch] BLOCK — explicit + genital tags: %s",
+                        "[AnimeBranch] BLOCK — rating=%s + explicit tags: %s",
+                        rating,
                         {t: f"{s:.3f}" for t, s in high_confidence.items()},
                     )
                     return BranchResult(
@@ -307,22 +318,24 @@ class AnimeBranch:
                         model="wdv3_tagger",
                         rating=rating,
                     )
-                else:
-                    # Explicit rating but no strong genital tags → REVIEW
-                    logger.info("[AnimeBranch] REVIEW — explicit rating, borderline genital tags")
-                    return BranchResult(
-                        verdict="REVIEW",
-                        detections=detections,
-                        max_score=max_score,
-                        model="wdv3_tagger",
-                        rating=rating,
-                    )
+
+            # 2. REVIEW / other verdicts
+            if rating == "explicit":
+                # Explicit rating but no strong explicit tags -> REVIEW
+                logger.info("[AnimeBranch] REVIEW — explicit rating, borderline explicit tags")
+                return BranchResult(
+                    verdict="REVIEW",
+                    detections=detections,
+                    max_score=max_score,
+                    model="wdv3_tagger",
+                    rating=rating,
+                )
 
             elif rating == "questionable":
-                # Only consult secondary if there are borderline genital tags
+                # Only consult secondary if there are borderline explicit tags
                 borderline = {
-                    t: s for t, s in genital_scores.items()
-                    if GENITAL_TAG_REVIEW_LOW <= s <= GENITAL_TAG_THRESHOLD
+                    t: s for t, s in explicit_scores.items()
+                    if EXPLICIT_TAG_REVIEW_LOW <= s <= EXPLICIT_TAG_THRESHOLD
                 }
                 if borderline:
                     secondary = self._run_anime_rating(image)
@@ -339,7 +352,7 @@ class AnimeBranch:
                         )
 
             # All other cases: SAFE
-            logger.debug("[AnimeBranch] SAFE — rating=%s, max_genital=%.3f", rating, max_score)
+            logger.debug("[AnimeBranch] SAFE — rating=%s, max_explicit=%.3f", rating, max_score)
             return BranchResult(verdict="SAFE", max_score=max_score, rating=rating)
 
         except Exception as e:

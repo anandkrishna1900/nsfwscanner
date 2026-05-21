@@ -5,6 +5,7 @@
 discord.py>=2.3.0
 
 # ML / Inference
+numpy>=1.26.0
 torch>=2.1.0
 torchvision>=0.16.0
 transformers>=4.40.0
