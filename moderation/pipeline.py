@@ -337,16 +337,27 @@ async def scan_attachment(
                 if branch_result.detections:
                     tags_str = "\n" + "\n".join(f"    - {tag}: {score:.2f}" for tag, score, _ in branch_result.detections)
 
-                secondary_consulted = "No (Borderline criteria not met)"
-                if branch_result.model == "anime_rating":
-                    secondary_consulted = "Yes (deepghs/anime_rating returned r18)"
+                wdv3_exp = getattr(branch_result, 'wdv3_explicit', 0.0)
+                ar_r18 = getattr(branch_result, 'anime_rating_r18', 0.0)
+                gen_sc = getattr(branch_result, 'genital_score', 0.0)
+                fin_sc = getattr(branch_result, 'final_score', 0.0)
 
                 steps.append(
-                    f"Stage 2B: Anime/Hentai Branch\n"
-                    f"  Primary Model: SmilingWolf/wd-vit-large-tagger-v3 (ONNX CPU)\n"
-                    f"  Tagger Rating: {getattr(branch_result, 'rating', 'unknown')}\n"
+                    f"Stage 2B: Anime/Hentai Branch (Score Fusion)\n"
+                    f"  Models:\n"
+                    f"    - SmilingWolf/wd-vit-large-tagger-v3 (ONNX CPU)\n"
+                    f"    - deepghs/anime_rating (ONNX CPU)\n"
+                    f"  Scores & Fusion Math:\n"
+                    f"    - wdv3_explicit: {wdv3_exp:.4f} (weight: 0.35)\n"
+                    f"    - anime_rating_r18: {ar_r18:.4f} (weight: 0.30)\n"
+                    f"    - genital_score: {gen_sc:.4f} (weight: 0.35)\n"
+                    f"    - Formula: ({wdv3_exp:.4f} * 0.35) + ({ar_r18:.4f} * 0.30) + ({gen_sc:.4f} * 0.35) = {fin_sc:.4f}\n"
+                    f"  Decision Thresholds:\n"
+                    f"    - BLOCK: >= 0.80\n"
+                    f"    - REVIEW: >= 0.65\n"
+                    f"    - SAFE: < 0.65\n"
                     f"  Detected Explicit Tags: {tags_str}\n"
-                    f"  Secondary Check: {secondary_consulted}\n"
+                    f"  Tagger Rating: {getattr(branch_result, 'rating', 'unknown')}\n"
                     f"  Verdict: {branch_result.verdict}"
                 )
 
@@ -371,6 +382,11 @@ async def scan_attachment(
                 if anime_res.detections:
                     anime_tags_str = "\n" + "\n".join(f"      - {tag}: {score:.2f}" for tag, score, _ in anime_res.detections)
 
+                anime_wdv3_exp = getattr(anime_res, 'wdv3_explicit', 0.0)
+                anime_ar_r18 = getattr(anime_res, 'anime_rating_r18', 0.0)
+                anime_gen_sc = getattr(anime_res, 'genital_score', 0.0)
+                anime_fin_sc = getattr(anime_res, 'final_score', 0.0)
+
                 steps.append(
                     f"Stage 2: Uncertain (Both Branches Evaluated)\n"
                     f"  Real/Photo Branch:\n"
@@ -378,7 +394,12 @@ async def scan_attachment(
                     f"    Detections: {real_detections_str}\n"
                     f"    Verdict: {real_res.verdict}\n"
                     f"  Anime/Illustration Branch:\n"
-                    f"    Model: SmilingWolf/wd-vit-large-tagger-v3 (ONNX CPU)\n"
+                    f"    Models: SmilingWolf/wd-vit-large-tagger-v3 & deepghs/anime_rating (ONNX CPU)\n"
+                    f"    Scores & Fusion Math:\n"
+                    f"      - wdv3_explicit: {anime_wdv3_exp:.4f} (weight: 0.35)\n"
+                    f"      - anime_rating_r18: {anime_ar_r18:.4f} (weight: 0.30)\n"
+                    f"      - genital_score: {anime_gen_sc:.4f} (weight: 0.35)\n"
+                    f"      - Formula: ({anime_wdv3_exp:.4f} * 0.35) + ({anime_ar_r18:.4f} * 0.30) + ({anime_gen_sc:.4f} * 0.35) = {anime_fin_sc:.4f}\n"
                     f"    Tagger Rating: {getattr(anime_res, 'rating', 'unknown')}\n"
                     f"    Detected Explicit Tags: {anime_tags_str}\n"
                     f"    Verdict: {anime_res.verdict}\n"
@@ -465,6 +486,14 @@ def _guess_suffix(url: str) -> str:
 
 def _build_reason(branch_result) -> str:
     """Build a human-readable reason string from a BranchResult."""
+    if hasattr(branch_result, 'final_score') and branch_result.final_score > 0:
+        # Anime branch score fusion reason
+        tags_part = ""
+        if branch_result.detections:
+            top = sorted(branch_result.detections, key=lambda x: x[1], reverse=True)
+            tags_part = ", " + ", ".join(f"{label} ({score:.2f})" for label, score, _ in top[:2])
+        return f"score={branch_result.final_score:.2f} (exp={branch_result.wdv3_explicit:.2f}, r18={branch_result.anime_rating_r18:.2f}, gen={branch_result.genital_score:.2f}{tags_part})"
+
     if not branch_result.detections:
         return f"rating={getattr(branch_result, 'rating', 'unknown')} (score={branch_result.max_score:.2f})"
 
