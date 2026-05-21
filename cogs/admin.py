@@ -2,7 +2,9 @@
 bot/cogs/admin.py — Admin slash command group for NSFW scanner control.
 
 All commands require Manage Messages permission.
-Channel monitoring config is persisted to nsfw_channels.json.
+Channel monitoring config is persisted to automod_config.json (same file
+that automod.py uses) under each guild's "channels" list — no separate
+nsfw_channels.json.
 """
 
 from __future__ import annotations
@@ -18,20 +20,43 @@ from discord.ext import commands
 
 logger = logging.getLogger(__name__)
 
-_CHANNELS_FILE = "nsfw_channels.json"
+_CONFIG_FILE = "automod_config.json"
+
+# Defaults mirror get_server_config() in automod.py exactly
+_DEFAULTS = {
+    "enabled": True,
+    "channels": [],
+    "punishment": "timeout",
+    "timeout_duration": 10,
+    "ban_duration": None,
+    "log_channel": None,
+    "whitelisted_roles": [],
+    "whitelisted_users": [],
+}
 
 
-def _load_channels() -> dict[str, list[int]]:
+def _load_config() -> dict:
     try:
-        with open(_CHANNELS_FILE, "r") as f:
+        with open(_CONFIG_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
 
 
-def _save_channels(data: dict) -> None:
-    with open(_CHANNELS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def _save_config(data: dict) -> None:
+    with open(_CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+
+def _get_guild(data: dict, guild_id: str) -> dict:
+    """Return the guild sub-dict, creating it with defaults if missing."""
+    if guild_id not in data:
+        data[guild_id] = dict(_DEFAULTS)
+    # Back-fill any missing keys
+    for k, v in _DEFAULTS.items():
+        if k not in data[guild_id]:
+            data[guild_id][k] = v
+    return data[guild_id]
 
 
 def _has_manage_messages():
@@ -69,26 +94,17 @@ class NSFWAdminCog(commands.Cog):
     ) -> None:
         """Enable NSFW scanning for a specific channel."""
         guild_id = str(interaction.guild_id)
-        data = _load_channels()
+        data = _load_config()
+        guild_cfg = _get_guild(data, guild_id)
 
-        if guild_id not in data:
-            data[guild_id] = []
-
-        if channel.id in data[guild_id]:
+        if channel.id in guild_cfg["channels"]:
             await interaction.response.send_message(
                 f"ℹ️ {channel.mention} is already being monitored.", ephemeral=True
             )
             return
 
-        data[guild_id].append(channel.id)
-        _save_channels(data)
-
-        # Also update the live config singleton
-        try:
-            from config import config as bot_config
-            bot_config.add_monitored_channel(channel.id)
-        except Exception as e:
-            logger.warning("Could not update live config: %s", e)
+        guild_cfg["channels"].append(channel.id)
+        _save_config(data)
 
         embed = discord.Embed(
             title="✅ Channel Added to Monitoring",
@@ -97,7 +113,7 @@ class NSFWAdminCog(commands.Cog):
         )
         embed.set_footer(text="Use /nsfw status to see all monitored channels")
         await interaction.response.send_message(embed=embed)
-        logger.info("Guild %s: added %s to NSFW monitoring", guild_id, channel.name)
+        logger.info("Guild %s: added #%s to NSFW monitoring", guild_id, channel.name)
 
     # ── /nsfw disable ─────────────────────────────────────────────────────────
 
@@ -110,22 +126,17 @@ class NSFWAdminCog(commands.Cog):
     ) -> None:
         """Disable NSFW scanning for a specific channel."""
         guild_id = str(interaction.guild_id)
-        data = _load_channels()
+        data = _load_config()
+        guild_cfg = _get_guild(data, guild_id)
 
-        if guild_id not in data or channel.id not in data.get(guild_id, []):
+        if channel.id not in guild_cfg["channels"]:
             await interaction.response.send_message(
                 f"ℹ️ {channel.mention} is not currently being monitored.", ephemeral=True
             )
             return
 
-        data[guild_id].remove(channel.id)
-        _save_channels(data)
-
-        try:
-            from config import config as bot_config
-            bot_config.remove_monitored_channel(channel.id)
-        except Exception as e:
-            logger.warning("Could not update live config: %s", e)
+        guild_cfg["channels"].remove(channel.id)
+        _save_config(data)
 
         embed = discord.Embed(
             title="🔕 Channel Removed from Monitoring",
@@ -133,7 +144,7 @@ class NSFWAdminCog(commands.Cog):
             color=0xEF4444,
         )
         await interaction.response.send_message(embed=embed)
-        logger.info("Guild %s: removed %s from NSFW monitoring", guild_id, channel.name)
+        logger.info("Guild %s: removed #%s from NSFW monitoring", guild_id, channel.name)
 
     # ── /nsfw status ──────────────────────────────────────────────────────────
 
@@ -148,20 +159,22 @@ class NSFWAdminCog(commands.Cog):
             from moderation import pipeline as pl
 
             guild_id = str(interaction.guild_id)
-            data = _load_channels()
-            guild_channels = data.get(guild_id, [])
+            data = _load_config()
+            guild_cfg = _get_guild(data, guild_id)
+            guild_channels: list[int] = guild_cfg.get("channels", [])
 
             # Resolve channel mentions
-            if bot_config.monitor_all:
-                channels_text = "**All channels** (MONITORED_CHANNELS=all)"
-            elif guild_channels:
+            if guild_channels:
                 mentions = []
                 for cid in guild_channels:
                     ch = interaction.guild.get_channel(cid)
                     mentions.append(ch.mention if ch else f"`{cid}`")
-                channels_text = "\n".join(mentions) if mentions else "None"
+                channels_text = "\n".join(mentions)
             else:
-                channels_text = "None configured — use `/nsfw enable #channel`"
+                channels_text = "All channels (no specific channels configured)"
+
+            # Scanner enabled/disabled
+            enabled_text = "🟢 Enabled" if guild_cfg.get("enabled", True) else "🔴 Disabled"
 
             # Loaded models info
             loaded = pl._initialized
@@ -186,7 +199,11 @@ class NSFWAdminCog(commands.Cog):
                     allocated = torch.cuda.memory_allocated() / 1e6
                     reserved = torch.cuda.memory_reserved() / 1e6
                     total = torch.cuda.get_device_properties(0).total_memory / 1e6
-                    vram_text = f"{allocated:.0f} MB allocated / {reserved:.0f} MB reserved / {total:.0f} MB total"
+                    vram_text = (
+                        f"{allocated:.0f} MB allocated / "
+                        f"{reserved:.0f} MB reserved / "
+                        f"{total:.0f} MB total"
+                    )
             except Exception:
                 pass
 
@@ -195,6 +212,8 @@ class NSFWAdminCog(commands.Cog):
                 color=0x6366F1,
                 timestamp=discord.utils.utcnow(),
             )
+            embed.add_field(name="⚙️ Scanner", value=enabled_text, inline=True)
+            embed.add_field(name="🔨 Punishment", value=guild_cfg.get("punishment", "timeout").title(), inline=True)
             embed.add_field(name="📡 Monitored Channels", value=channels_text, inline=False)
             embed.add_field(name="🧠 AI Models", value="\n".join(model_lines), inline=False)
             embed.add_field(name="💾 VRAM Usage", value=vram_text, inline=False)

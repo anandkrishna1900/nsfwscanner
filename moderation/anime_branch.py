@@ -126,23 +126,33 @@ class AnimeBranch:
     def _load_anime_rating(self) -> None:
         """Load deepghs/anime_rating ONNX secondary model."""
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download, list_repo_files
 
-        logger.info("[AnimeBranch] Loading deepghs/anime_rating…")
+        logger.info("[AnimeBranch] Loading deepghs/anime_rating...")
 
-        for filename in ("model.onnx", "anime_rating.onnx", "classifier.onnx"):
-            try:
-                model_path = hf_hub_download(
-                    repo_id="deepghs/anime_rating",
-                    filename=filename,
-                    cache_dir=self._cache_dir,
+        try:
+            repo_files = list(list_repo_files("deepghs/anime_rating"))
+            onnx_files = [f for f in repo_files if f.endswith(".onnx")]
+            if not onnx_files:
+                raise RuntimeError("No ONNX files found in deepghs/anime_rating")
+            
+            preferred = next(
+                (f for f in onnx_files if "caformer_s36_plus" in f.lower()),
+                next(
+                    (f for f in onnx_files if "caformer" in f.lower()),
+                    onnx_files[0]
                 )
-                break
-            except Exception:
-                continue
-        else:
+            )
+            
+            logger.info("[AnimeBranch] Selected anime rating model file: %s", preferred)
+            model_path = hf_hub_download(
+                repo_id="deepghs/anime_rating",
+                filename=preferred,
+                cache_dir=self._cache_dir,
+            )
+        except Exception as e:
             logger.warning(
-                "[AnimeBranch] Could not load deepghs/anime_rating — secondary check disabled"
+                "[AnimeBranch] Could not load deepghs/anime_rating: %s — secondary check disabled", e
             )
             return
 

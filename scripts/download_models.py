@@ -29,17 +29,17 @@ os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 
 
 def banner(text: str) -> None:
-    print(f"\n{'━' * 60}")
+    print(f"\n{'=' * 60}")
     print(f"  {text}")
-    print(f"{'━' * 60}")
+    print(f"{'=' * 60}")
 
 
 def check_mark(text: str) -> None:
-    print(f"  ✅ {text}")
+    print(f"  [OK] {text}")
 
 
 def fail_mark(text: str) -> None:
-    print(f"  ❌ {text}")
+    print(f"  [FAIL] {text}")
 
 
 def download_onnx(repo_id: str, filename: str, label: str) -> bool:
@@ -47,7 +47,7 @@ def download_onnx(repo_id: str, filename: str, label: str) -> bool:
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import HfHubHTTPError
 
-    print(f"\n  Downloading {label}…")
+    print(f"\n  Downloading {label}...")
     print(f"    Repo: {repo_id}")
     print(f"    File: {filename}")
     print(f"    Cache: {MODEL_CACHE_DIR}")
@@ -62,7 +62,7 @@ def download_onnx(repo_id: str, filename: str, label: str) -> bool:
         )
         elapsed = time.time() - t0
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        check_mark(f"Done in {elapsed:.1f}s — {size_mb:.0f} MB → {path}")
+        check_mark(f"Done in {elapsed:.1f}s - {size_mb:.0f} MB -> {path}")
         return True
     except Exception as e:
         fail_mark(f"Failed: {e}")
@@ -75,7 +75,7 @@ def download_extra_files(repo_id: str, filenames: list[str], label: str) -> bool
 
     all_ok = True
     for fname in filenames:
-        print(f"  Downloading {label} → {fname}…")
+        print(f"  Downloading {label} -> {fname}...")
         try:
             path = hf_hub_download(
                 repo_id=repo_id,
@@ -83,7 +83,7 @@ def download_extra_files(repo_id: str, filenames: list[str], label: str) -> bool
                 cache_dir=MODEL_CACHE_DIR,
                 local_files_only=False,
             )
-            check_mark(f"{fname} → {path}")
+            check_mark(f"{fname} -> {path}")
         except Exception as e:
             fail_mark(f"{fname}: {e}")
             all_ok = False
@@ -92,7 +92,7 @@ def download_extra_files(repo_id: str, filenames: list[str], label: str) -> bool
 
 def init_nudenet() -> bool:
     """Trigger NudeDetector initialization so it downloads its model."""
-    print("\n  Initializing NudeDetector (downloads ~5 MB model)…")
+    print("\n  Initializing NudeDetector (downloads ~5 MB model)...")
     try:
         from nudenet import NudeDetector
         _ = NudeDetector()
@@ -108,7 +108,7 @@ def verify_onnx(repo_id: str, filename: str, label: str) -> None:
     from huggingface_hub import hf_hub_download
     import onnxruntime as ort
 
-    print(f"  Verifying {label}…")
+    print(f"  Verifying {label}...")
     try:
         path = hf_hub_download(
             repo_id=repo_id,
@@ -118,7 +118,7 @@ def verify_onnx(repo_id: str, filename: str, label: str) -> None:
         )
         sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
         inp_shape = sess.get_inputs()[0].shape
-        check_mark(f"Valid ONNX — input shape: {inp_shape}")
+        check_mark(f"Valid ONNX - input shape: {inp_shape}")
     except Exception as e:
         fail_mark(f"Verification failed: {e}")
 
@@ -149,15 +149,26 @@ def main() -> None:
 
     # ── 2. deepghs/anime_real_cls ─────────────────────────────────────────────
     banner("Model 2/4: deepghs/anime_real_cls (Gatekeeper)")
-    ok = False
-    for fname in ("model.onnx", "anime_real_cls.onnx", "classifier.onnx"):
-        ok = download_onnx(
-            repo_id="deepghs/anime_real_cls",
-            filename=fname,
-            label=f"deepghs/anime_real_cls ({fname})",
-        )
-        if ok:
-            break
+    try:
+        from huggingface_hub import list_repo_files
+        repo_files = list(list_repo_files("deepghs/anime_real_cls"))
+        onnx_files = [f for f in repo_files if f.endswith(".onnx")]
+        if onnx_files:
+            preferred = next(
+                (f for f in onnx_files if "caformer" in f.lower()),
+                onnx_files[0],
+            )
+            ok = download_onnx(
+                repo_id="deepghs/anime_real_cls",
+                filename=preferred,
+                label=f"deepghs/anime_real_cls ({preferred})",
+            )
+        else:
+            print("  [FAIL] No ONNX files found in deepghs/anime_real_cls repository.")
+            ok = False
+    except Exception as e:
+        print(f"  [FAIL] Failed to list repo files for deepghs/anime_real_cls: {e}")
+        ok = False
     results["gatekeeper"] = ok
 
     # ── 3. SmilingWolf/wd-vit-large-tagger-v3 ────────────────────────────────
@@ -176,15 +187,29 @@ def main() -> None:
 
     # ── 4. deepghs/anime_rating ───────────────────────────────────────────────
     banner("Model 4/4: deepghs/anime_rating (Anime Rating Secondary)")
-    ok = False
-    for fname in ("model.onnx", "anime_rating.onnx", "classifier.onnx"):
-        ok = download_onnx(
-            repo_id="deepghs/anime_rating",
-            filename=fname,
-            label=f"deepghs/anime_rating ({fname})",
-        )
-        if ok:
-            break
+    try:
+        from huggingface_hub import list_repo_files
+        repo_files = list(list_repo_files("deepghs/anime_rating"))
+        onnx_files = [f for f in repo_files if f.endswith(".onnx")]
+        if onnx_files:
+            preferred = next(
+                (f for f in onnx_files if "caformer_s36_plus" in f.lower()),
+                next(
+                    (f for f in onnx_files if "caformer" in f.lower()),
+                    onnx_files[0],
+                )
+            )
+            ok = download_onnx(
+                repo_id="deepghs/anime_rating",
+                filename=preferred,
+                label=f"deepghs/anime_rating ({preferred})",
+            )
+        else:
+            print("  [FAIL] No ONNX files found in deepghs/anime_rating repository.")
+            ok = False
+    except Exception as e:
+        print(f"  [FAIL] Failed to list repo files for deepghs/anime_rating: {e}")
+        ok = False
     results["anime_rating"] = ok
 
     # ── 5. NudeNet ────────────────────────────────────────────────────────────
@@ -197,16 +222,16 @@ def main() -> None:
     print("=" * 60)
     all_ok = True
     for name, success in results.items():
-        status = "✅" if success else "❌ FAILED"
+        status = "[OK]  " if success else "[FAIL]"
         print(f"  {status}  {name}")
         if not success:
             all_ok = False
 
     if all_ok:
-        print("\n✅ All models downloaded successfully!")
+        print("\nAll models downloaded successfully!")
         print("   You can now start the bot with: python main.py")
     else:
-        print("\n⚠️  Some models failed to download.")
+        print("\nSome models failed to download.")
         print("   Check your internet connection and try again.")
         print("   The bot will attempt to download missing models on first use.")
 

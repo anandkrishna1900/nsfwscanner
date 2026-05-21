@@ -45,8 +45,15 @@ class RealBranch:
     Detects explicit genital content in real/photographic images using NudeNet.
 
     NudeNet uses ONNX internally and runs entirely on CPU.
+    NudeDetector is instantiated once in __init__ so the ONNX model is loaded
+    from disk only once and reused across all scan() calls.
     All inference is synchronous — wrap calls in asyncio.to_thread().
     """
+
+    def __init__(self) -> None:
+        from nudenet import NudeDetector
+        self._detector = NudeDetector()
+        logger.info("[RealBranch] NudeDetector loaded")
 
     def scan(self, image: Image.Image) -> BranchResult:
         """
@@ -64,16 +71,13 @@ class RealBranch:
         tmp_path: Optional[str] = None
 
         try:
-            from nudenet import NudeDetector
-
             # ── 1. Save to temp file ──────────────────────────────────────────
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 tmp_path = tmp.name
                 image.convert("RGB").save(tmp_path, format="JPEG", quality=95)
 
             # ── 2. Run NudeNet ────────────────────────────────────────────────
-            detector = NudeDetector()
-            raw_detections: list[dict] = detector.detect(tmp_path)
+            raw_detections: list[dict] = self._detector.detect(tmp_path)
             # raw_detections format (NudeNet v3):
             # [{"class": "FEMALE_BREAST_EXPOSED", "score": 0.91, "box": [x,y,w,h]}, ...]
 

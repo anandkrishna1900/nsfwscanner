@@ -47,17 +47,8 @@ async def on_message(message: discord.Message) -> None:
 
 # ── Cog loader ────────────────────────────────────────────────────────────────
 COGS = [
-    # Existing cogs (unchanged)
-    "cogs.info",
-    "cogs.utility",
-    "cogs.fun",
-    "cogs.moderation",
-    "cogs.automod",         # Rewritten — now uses local AI pipeline
-    "cogs.automod_setup",   # Setup wizard (unchanged)
-    "cogs.tasks",
-    "cogs.errors",
-    # New NSFW admin slash commands
-    "bot.cogs.admin",
+    "cogs.automod",
+    "cogs.admin",
 ]
 
 
@@ -110,16 +101,43 @@ async def on_error(event: str, *args, **kwargs) -> None:
     logger.exception("Unhandled error in event %s", event)
 
 
+# ── Persisted channel loader ──────────────────────────────────────────────────
+def _load_persisted_channels(cfg) -> None:
+    """
+    Merge channel IDs saved by /nsfw enable (in automod_config.json) into the
+    live config.monitored_channels list so they survive a bot restart.
+    """
+    import json as _json
+    import os as _os
+    path = "automod_config.json"
+    if not _os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+        added = 0
+        for guild_data in data.values():
+            for cid in guild_data.get("channels", []):
+                if cid not in cfg.monitored_channels:
+                    cfg.monitored_channels.append(cid)
+                    added += 1
+        if added:
+            logger.info(
+                "Loaded %d persisted channel(s) from automod_config.json",
+                added,
+            )
+    except Exception as e:
+        logger.warning("Could not load persisted channels: %s", e)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main() -> None:
     bot.start_time = time.time()
 
-    # Initialize database (SQLite — creates bot.db in the project directory)
-    try:
-        from database import init_db_pool
-        await init_db_pool()
-    except Exception as e:
-        logger.warning("Database init warning (bot will still start): %s", e)
+    # Initialize database (Removed, relying only on log channels per AGENTS.md)
+
+    # Merge channels persisted by /nsfw enable into live config
+    _load_persisted_channels(config)
 
     async with bot:
         await load_cogs()
@@ -128,11 +146,6 @@ async def main() -> None:
         except KeyboardInterrupt:
             pass
         finally:
-            try:
-                from database import close_db
-                await close_db()
-            except Exception:
-                pass
             logger.info("Bot shutdown complete.")
 
 

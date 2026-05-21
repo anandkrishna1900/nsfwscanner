@@ -1,11 +1,11 @@
 """
-cogs/automod.py — NSFW Moderation cog.
+bot/cogs/automod.py — NSFW Moderation cog.
 
 Listens for messages in monitored channels, runs the local AI pipeline,
 and takes action based on the BLOCK / REVIEW / SAFE verdict.
 
-Preserves all existing per-guild config (punishment, threshold, whitelist, log_channel)
-from automod_config.json.
+Per-guild config (punishment, channels, whitelist, log_channel) is stored
+in automod_config.json.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Optional
 import aiohttp
 import discord
 from discord.ext import commands
+from config import config as bot_config
 
 logger = logging.getLogger(__name__)
 
@@ -108,10 +109,10 @@ class AutoMod(commands.Cog):
         if gid not in self.config:
             self.config[gid] = {
                 "enabled": True,
+                "channels": [],
                 "punishment": "timeout",
                 "timeout_duration": 10,
                 "ban_duration": None,
-                "nsfw_threshold": 50,
                 "log_channel": None,
                 "whitelisted_roles": [],
                 "whitelisted_users": [],
@@ -120,10 +121,10 @@ class AutoMod(commands.Cog):
 
         defaults = {
             "enabled": True,
+            "channels": [],
             "punishment": "timeout",
             "timeout_duration": 10,
             "ban_duration": None,
-            "nsfw_threshold": 50,
             "log_channel": None,
             "whitelisted_roles": [],
             "whitelisted_users": [],
@@ -206,11 +207,7 @@ class AutoMod(commands.Cog):
             logger.error("Punishment failed for %s: %s", member, e)
 
     async def _log_action(self, user: discord.User, action: str, reason: str) -> None:
-        try:
-            from database import add_modlog
-            await add_modlog(user.id, action, reason, self.bot.user.id)
-        except Exception as e:
-            logger.warning("DB log failed: %s", e)
+        logger.info("Action taken on %s: %s - %s", user, action, reason)
 
     async def _send_dm(
         self, user: discord.User, guild_name: str
@@ -352,13 +349,11 @@ class AutoMod(commands.Cog):
             if not cfg.get("enabled", True):
                 return
 
-            # Check channel monitoring
-            from config import config as bot_config
-
-            # Use the bot_config monitored_channels if set, otherwise use per-guild config
-            if not bot_config.monitor_all and bot_config.monitored_channels:
-                if message.channel.id not in bot_config.monitored_channels:
-                    return
+            # Channel monitoring: if cfg["channels"] is non-empty, only scan those.
+            # If empty, scan all channels in this guild (global enable behaviour).
+            guild_channels = cfg.get("channels", [])
+            if guild_channels and message.channel.id not in guild_channels:
+                return
 
             # Check whitelist — roles
             member_role_ids = [r.id for r in message.author.roles]
@@ -463,13 +458,22 @@ class AutoMod(commands.Cog):
             if cfg["log_channel"]:
                 log_channel = ctx.guild.get_channel(int(cfg["log_channel"]))
 
+            channels = cfg.get("channels", [])
+            if channels:
+                ch_list = ", ".join(
+                    (ctx.guild.get_channel(c).mention if ctx.guild.get_channel(c) else str(c))
+                    for c in channels
+                )
+            else:
+                ch_list = "All channels"
+
             em = discord.Embed(title="🤖 NSFW Scanner (Local AI)", color=discord.Color.blue())
             em.add_field(name="Status", value=status, inline=True)
-            em.add_field(name="Threshold", value=f"{cfg['nsfw_threshold']}%", inline=True)
             em.add_field(name="Punishment", value=cfg["punishment"].title(), inline=True)
             em.add_field(name="Engine", value="Local AI Pipeline (4-model council)", inline=True)
+            em.add_field(name="Monitoring", value=ch_list, inline=False)
             em.add_field(name="Log Channel", value=log_channel.mention if log_channel else "Not set", inline=True)
-            em.set_footer(text="Use /scanner commands to configure | /nsfw for new slash commands")
+            em.set_footer(text="Use /scanner commands to configure | /nsfw for slash commands")
             await ctx.send(embed=em)
 
     @scanner.command(description="Enable/disable scanner")
@@ -479,16 +483,6 @@ class AutoMod(commands.Cog):
         cfg["enabled"] = not cfg["enabled"]
         self.save_config()
         await ctx.send(f"✅ Scanner {'enabled' if cfg['enabled'] else 'disabled'}")
-
-    @scanner.command(description="Set detection threshold (1-100)")
-    @commands.has_permissions(manage_messages=True)
-    async def threshold(self, ctx: commands.Context, percentage: int) -> None:
-        if not 1 <= percentage <= 100:
-            return await ctx.send("❌ Use 1-100", ephemeral=True)
-        cfg = self.get_server_config(ctx.guild.id)
-        cfg["nsfw_threshold"] = percentage
-        self.save_config()
-        await ctx.send(f"✅ Threshold: {percentage}%")
 
     @scanner.command(description="Set punishment type (none/kick/ban/timeout)")
     @commands.has_permissions(manage_messages=True)

@@ -43,26 +43,43 @@ class ContentTypeRouter:
     def _load(self) -> None:
         """Download and load the deepghs/anime_real_cls ONNX model."""
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download, list_repo_files
 
         logger.info("[Gatekeeper] Loading deepghs/anime_real_cls ONNX…")
 
-        # Try common filenames
-        for filename in ("model.onnx", "anime_real_cls.onnx", "classifier.onnx"):
-            try:
-                model_path = hf_hub_download(
-                    repo_id="deepghs/anime_real_cls",
-                    filename=filename,
-                    cache_dir=self._cache_dir,
-                    local_files_only=False,
-                )
-                break
-            except Exception:
-                continue
-        else:
+        # Discover the actual ONNX file(s) in the repo rather than guessing names
+        try:
+            repo_files = list(list_repo_files("deepghs/anime_real_cls"))
+        except Exception as e:
             raise RuntimeError(
-                "Could not download deepghs/anime_real_cls model. "
-                "Check MODEL_CACHE_DIR and internet connection."
+                f"Could not list files in deepghs/anime_real_cls: {e}. "
+                "Check internet connection."
+            )
+
+        onnx_files = [f for f in repo_files if f.endswith(".onnx")]
+        if not onnx_files:
+            raise RuntimeError(
+                "No ONNX file found in deepghs/anime_real_cls. "
+                "The repo structure may have changed."
+            )
+
+        # Prefer a caformer variant (best quality); fall back to first .onnx found
+        preferred = next(
+            (f for f in onnx_files if "caformer" in f.lower()),
+            onnx_files[0],
+        )
+        logger.info("[Gatekeeper] Selected model file: %s", preferred)
+
+        try:
+            model_path = hf_hub_download(
+                repo_id="deepghs/anime_real_cls",
+                filename=preferred,
+                cache_dir=self._cache_dir,
+                local_files_only=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to download deepghs/anime_real_cls/{preferred}: {e}"
             )
 
         opts = ort.SessionOptions()

@@ -1,1 +1,0 @@
-# bot.cogs package
