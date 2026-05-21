@@ -1,88 +1,112 @@
-import discord
-from discord.ext import commands
-import aiohttp
+"""
+cogs/automod.py — NSFW Moderation cog.
+
+Listens for messages in monitored channels, runs the local AI pipeline,
+and takes action based on the BLOCK / REVIEW / SAFE verdict.
+
+Preserves all existing per-guild config (punishment, threshold, whitelist, log_channel)
+from automod_config.json.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
-from datetime import datetime, timedelta
 import logging
 import re
+from datetime import datetime, timedelta
 from io import BytesIO
+from typing import Optional
 
-logging.basicConfig(level=logging.INFO)
+import aiohttp
+import discord
+from discord.ext import commands
+
 logger = logging.getLogger(__name__)
 
+
+# ── Verdict severity helper ────────────────────────────────────────────────────
+_SEVERITY = {"SAFE": 0, "REVIEW": 1, "BLOCK": 2}
+
+
 class RemoveTimeoutView(discord.ui.View):
-    """Button view to remove timeout"""
-    def __init__(self, user_id: int):
+    """Button view to remove timeout from the log embed."""
+
+    def __init__(self, user_id: int) -> None:
         super().__init__(timeout=None)
         self.user_id = user_id
-    
+
     @discord.ui.button(label="Remove Timeout", style=discord.ButtonStyle.green, emoji="✅")
-    async def remove_timeout_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def remove_timeout_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         try:
-            # Check if user has permissions
             if not interaction.user.guild_permissions.moderate_members:
-                return await interaction.response.send_message("❌ You don't have permission to do this!", ephemeral=True)
-            
-            # Get the member
+                return await interaction.response.send_message(
+                    "❌ You don't have permission to do this!", ephemeral=True
+                )
             member = interaction.guild.get_member(self.user_id)
             if not member:
-                return await interaction.response.send_message("❌ User not found in server!", ephemeral=True)
-            
-            # Remove timeout
+                return await interaction.response.send_message(
+                    "❌ User not found in server!", ephemeral=True
+                )
             await member.timeout(None, reason=f"Timeout removed by {interaction.user.name}")
-            
-            # Update the embed to show timeout was removed
+
             original_embed = interaction.message.embeds[0]
-            
-            # Add new field showing timeout was removed
             original_embed.add_field(
                 name="⚠️ Timeout Status",
-                value=f"**Removed by:** {interaction.user.mention}\n**At:** <t:{int(discord.utils.utcnow().timestamp())}:F>",
-                inline=False
+                value=f"**Removed by:** {interaction.user.mention}\n"
+                      f"**At:** <t:{int(discord.utils.utcnow().timestamp())}:F>",
+                inline=False,
             )
-            
-            # Change embed color to show it's been handled
-            original_embed.color = 0x808080  # Gray color
-            
-            # Update button to disabled
+            original_embed.color = 0x808080
             button.disabled = True
             button.label = "Timeout Removed"
             button.style = discord.ButtonStyle.gray
-            
             await interaction.response.edit_message(embed=original_embed, view=self)
-            
-            # Send confirmation
-            await interaction.followup.send(f"✅ Removed timeout from {member.mention}", ephemeral=True)
-            
-            logger.info(f"✅ {interaction.user.name} removed timeout from {member.name}")
-            
+            await interaction.followup.send(
+                f"✅ Removed timeout from {member.mention}", ephemeral=True
+            )
         except Exception as e:
-            logger.error(f"Failed to remove timeout: {e}")
-            await interaction.response.send_message(f"❌ Failed to remove timeout: {e}", ephemeral=True)
+            logger.error("Failed to remove timeout: %s", e)
+            await interaction.response.send_message(
+                f"❌ Failed to remove timeout: {e}", ephemeral=True
+            )
+
 
 class AutoMod(commands.Cog):
-    def __init__(self, bot):
+    """
+    NSFW auto-moderation cog.
+
+    Uses the local AI pipeline (moderation/pipeline.py) instead of the FastAPI endpoint.
+    Per-guild config (punishment, threshold, whitelist, log_channel) is preserved from
+    automod_config.json for backwards compatibility.
+    """
+
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.config_file = "automod_config.json"
+        self._guild_locks: dict[int, asyncio.Lock] = {}
         self.load_config()
-        self.api_endpoint = "http://127.0.0.1:8000/v1/detect/urls"
-        logger.info("🤖 AutoMod initialized with NSFW Detection AI")
-    
-    def load_config(self):
+        logger.info("🤖 AutoMod initialized with local AI pipeline")
+
+    # ── Config helpers ────────────────────────────────────────────────────────
+
+    def load_config(self) -> None:
         try:
             with open(self.config_file, "r") as f:
                 self.config = json.load(f)
         except FileNotFoundError:
             self.config = {}
-    
-    def save_config(self):
+
+    def save_config(self) -> None:
         with open(self.config_file, "w") as f:
             json.dump(self.config, f, indent=4)
-    
-    def get_server_config(self, guild_id):
-        guild_id = str(guild_id)
-        if guild_id not in self.config:
-            self.config[guild_id] = {
+
+    def get_server_config(self, guild_id: int) -> dict:
+        gid = str(guild_id)
+        if gid not in self.config:
+            self.config[gid] = {
                 "enabled": True,
                 "punishment": "timeout",
                 "timeout_duration": 10,
@@ -90,11 +114,11 @@ class AutoMod(commands.Cog):
                 "nsfw_threshold": 50,
                 "log_channel": None,
                 "whitelisted_roles": [],
-                "whitelisted_users": []
+                "whitelisted_users": [],
             }
             self.save_config()
-        
-        default_keys = {
+
+        defaults = {
             "enabled": True,
             "punishment": "timeout",
             "timeout_duration": 10,
@@ -102,582 +126,398 @@ class AutoMod(commands.Cog):
             "nsfw_threshold": 50,
             "log_channel": None,
             "whitelisted_roles": [],
-            "whitelisted_users": []
+            "whitelisted_users": [],
         }
-        
-        for key, default_value in default_keys.items():
-            if key not in self.config[guild_id]:
-                self.config[guild_id][key] = default_value
-        
+        for k, v in defaults.items():
+            if k not in self.config[gid]:
+                self.config[gid][k] = v
         self.save_config()
-        return self.config[guild_id]
-    
-    def extract_image_urls(self, message):
-        """Extract image URLs from attachments, embeds, and message content"""
-        urls = []
-        sources = []
-        file_info = []  # Store (filename, url, size)
-        
-        # Check attachments
+        return self.config[gid]
+
+    def _guild_lock(self, guild_id: int) -> asyncio.Lock:
+        if guild_id not in self._guild_locks:
+            self._guild_locks[guild_id] = asyncio.Lock()
+        return self._guild_locks[guild_id]
+
+    # ── Image URL extraction ──────────────────────────────────────────────────
+
+    def extract_media_urls(self, message: discord.Message) -> list[tuple[str, str, int]]:
+        """
+        Extract media URLs from attachments, embeds, and message content.
+        Returns list of (url, filename, size_bytes).
+        """
+        results: list[tuple[str, str, int]] = []
+
         for att in message.attachments:
-            urls.append(att.url)
-            sources.append(f"Attachment: {att.filename}")
-            file_info.append((att.filename, att.url, att.size))
-            logger.info(f"   📎 Attachment: {att.filename}")
-        
-        # Check embeds
+            # Only process image/gif/video content
+            ct = att.content_type or ""
+            if any(ct.startswith(prefix) for prefix in ("image/", "video/")):
+                results.append((att.url, att.filename, att.size))
+            elif att.filename.lower().split(".")[-1] in (
+                "jpg", "jpeg", "png", "gif", "webp", "mp4", "webm", "mov", "avi"
+            ):
+                results.append((att.url, att.filename, att.size))
+
         for embed in message.embeds:
             if embed.image and embed.image.url:
-                urls.append(embed.image.url)
-                sources.append(f"Embed Image")
-                file_info.append(("embed_image", embed.image.url, 0))
-                logger.info(f"   🖼️ Embed Image: {embed.image.url[:50]}...")
-            
-            if embed.thumbnail and embed.thumbnail.url:
-                urls.append(embed.thumbnail.url)
-                sources.append(f"Embed Thumbnail")
-                file_info.append(("embed_thumbnail", embed.thumbnail.url, 0))
-                logger.info(f"   🖼️ Embed Thumbnail")
-        
-        # Check message content for URLs
+                results.append((embed.image.url, "embed_image", 0))
+
         if message.content:
-            image_patterns = [
-                r'https?://[^\s]+\.(?:jpg|jpeg|png|gif|webp|bmp)',
-                r'https?://cdn\.discordapp\.com/attachments/[^\s]+',
-                r'https?://media\.discordapp\.net/attachments/[^\s]+',
-                r'https?://i\.imgur\.com/[^\s]+',
+            patterns = [
+                r"https?://[^\s]+\.(?:jpg|jpeg|png|gif|webp|mp4|webm|mov)",
+                r"https?://cdn\.discordapp\.com/attachments/[^\s]+",
+                r"https?://media\.discordapp\.net/attachments/[^\s]+",
+                r"https?://i\.imgur\.com/[^\s]+",
             ]
-            
-            for pattern in image_patterns:
-                matches = re.findall(pattern, message.content, re.IGNORECASE)
-                for match in matches:
-                    clean_url = match.split('?')[0]
-                    if clean_url not in urls:
-                        urls.append(clean_url)
-                        sources.append(f"URL in message")
-                        file_info.append(("linked_image", clean_url, 0))
-                        logger.info(f"   🔗 URL: {clean_url[:50]}...")
-        
-        return urls, sources, file_info
-    
-    async def check_image_content(self, image_urls):
-        """Check images using AI API"""
-        logger.info(f"🔍 Sending {len(image_urls)} URLs to AI")
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                payload = {"urls": image_urls}
-                async with session.post(
-                    self.api_endpoint,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=120
-                ) as response:
-                    if response.status == 200:
-                        results = await response.json()
-                        for i, result in enumerate(results):
-                            status = "🚨 NSFW" if result.get("is_nsfw") else "✅ Safe"
-                            confidence = result.get("confidence_percentage", 0)
-                            logger.info(f"   Result {i+1}: {status} ({confidence}%)")
-                        return results
-                    else:
-                        logger.error(f"❌ API error: {response.status}")
-                        return None
-        except Exception as e:
-            logger.error(f"❌ Connection error: {e}", exc_info=True)
-            return None
-    
-    async def log_action(self, user, action, reason):
-        try:
-            # Use database instead of JSON
-            from database import add_modlog
-            # moderator_id is None/0 for AI/AutoMod
-            # For postgres, ensure user.id is int
-            await add_modlog(user.id, action, reason, self.bot.user.id)
-            logger.info(f"📝 Logged action to database: {action} for {user}")
-        except Exception as e:
-            logger.error(f"❌ Failed to log to database: {e}")
-    
-    async def send_log_to_channel(self, message, file_info, punishment_type, violations):
-        """Send detailed log to configured log channel"""
-        config = self.get_server_config(message.guild.id)
-        log_channel_id = config.get("log_channel")
-        
-        logger.info(f"📝 Attempting to log. Channel ID: {log_channel_id}")
-        
-        if not log_channel_id:
-            logger.warning("❌ No log channel configured")
-            return
-        
-        try:
-            log_channel = message.guild.get_channel(int(log_channel_id))
-            if not log_channel:
-                logger.error(f"❌ Log channel {log_channel_id} not found")
-                return
-            
-            logger.info(f"✅ Found log channel: #{log_channel.name}")
-            
-            # Get member info
-            member = message.author
-            
-            # Calculate times
-            now = discord.utils.utcnow()
-            
-            # Get roles
-            roles_list = [role.name for role in member.roles if role.name != "@everyone"]
-            roles_text = ", ".join(roles_list) if roles_list else "None"
-            
-            # Create embed
-            embed = discord.Embed(
-                title="🚨 NSFW Content Detected",
-                color=0x2B2D31,
-                timestamp=now
-            )
-            
-            embed.set_thumbnail(url=member.display_avatar.url)
-            
-            # Add fields
-            embed.add_field(
-                name="User:",
-                value=f"{member.mention} (`{member.id}`)",
-                inline=False
-            )
-            
-            # Use channel mention instead of name
-            embed.add_field(
-                name="Channel:",
-                value=message.channel.mention,
-                inline=False
-            )
-            
-            embed.add_field(
-                name="Message ID:",
-                value=f"`{message.id}`",
-                inline=False
-            )
-            
-            embed.add_field(
-                name="👤 User Information",
-                value=f"**Username:** {member.name}\n**Display Name:** {member.display_name}",
-                inline=False
-            )
-            
-            # Use Discord timestamps for account creation
-            account_created_timestamp = int(member.created_at.timestamp())
-            embed.add_field(
-                name="📅 Account Information",
-                value=f"**Created:** <t:{account_created_timestamp}:F>\n**Age:** <t:{account_created_timestamp}:R>",
-                inline=True
-            )
-            
-            # Use Discord timestamps for join date
-            if member.joined_at:
-                joined_timestamp = int(member.joined_at.timestamp())
-                embed.add_field(
-                    name="🏠 Server Information",
-                    value=f"**Joined:** <t:{joined_timestamp}:F>\n**Member for:** <t:{joined_timestamp}:R>",
-                    inline=True
-                )
-            else:
-                embed.add_field(
-                    name="🏠 Server Information",
-                    value=f"**Joined:** Unknown\n**Member for:** Unknown",
-                    inline=True
-                )
-            
-            embed.add_field(
-                name="🎭 Roles",
-                value=roles_text,
-                inline=False
-            )
-            
-            message_text = message.content if message.content else "No text content"
-            embed.add_field(
-                name="💬 Message Content",
-                value=message_text[:1024],
-                inline=False
-            )
-            
-            # Attachments with clickable URLs
-            if file_info:
-                attachments_list = []
-                for filename, url, size in file_info:
-                    if size > 0:
-                        link_text = f"**[{filename}]({url})**"
-                        attachments_list.append(f"{link_text} `({size} bytes)`")
-                    else:
-                        attachments_list.append(f"**[{filename}]({url})**")
-                
-                attachments_text = "\n".join(attachments_list)
-                if len(attachments_text) > 1024:
-                    attachments_text = attachments_text[:1000] + "\n...(truncated)"
-                
-                embed.add_field(
-                    name="📎 Attachments",
-                    value=attachments_text,
-                    inline=False
-                )
-            
-            # Add AI detection results with confidence percentages
-            if violations:
-                violations_text = "\n".join(violations)
-                embed.add_field(
-                    name="🤖 AI Detection Results",
-                    value=violations_text[:1024],
-                    inline=False
-                )
-            
-            # Add the server's configured threshold
-            threshold = config.get("nsfw_threshold", 50)
-            embed.add_field(
-                name="⚙️ Server Threshold",
-                value=f"{threshold}%",
-                inline=True
-            )
-            
-            embed.set_footer(text="NSFW Detection System • Raiden")
-            
-            logger.info("📤 Sending log embed...")
-            
-            # Add button if punishment is timeout
-            view = None
-            if punishment_type == "timeout":
-                view = RemoveTimeoutView(member.id)
-            
-            # Send the main embed first
-            log_message = await log_channel.send(embed=embed, view=view)
-            
-            # Send image preview as separate message with spoiler (AFTER main log)
-            if file_info:
-                try:
-                    # Download and re-upload the first image to preserve it
-                    first_image_url = file_info[0][1]
-                    first_filename = file_info[0][0]
-                    
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(first_image_url, timeout=10) as resp:
-                            if resp.status == 200:
-                                image_data = await resp.read()
-                                
-                                # Create file object with spoiler
-                                file = discord.File(
-                                    fp=BytesIO(image_data),
-                                    filename=f"SPOILER_{first_filename}",
-                                    spoiler=True
-                                )
-                                
-                                # Send as separate message with spoiler warning
-                                preview_embed = discord.Embed(
-                                    description="⚠️ **Flagged Content Preview** (Click to reveal)",
-                                    color=0xFF0000
-                                )
-                                
-                                await log_channel.send(embed=preview_embed, file=file)
-                                logger.info("✅ Image preview sent with spoiler")
-                            else:
-                                logger.warning(f"Failed to download image for preview: {resp.status}")
-                except Exception as e:
-                    logger.error(f"Failed to send image preview: {e}")
-            
-            logger.info("✅ Log sent successfully!")
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to send log: {e}", exc_info=True)
-    
-    async def punish_user(self, message, reason, config):
-        punishment = config["punishment"]
-        duration = config.get("timeout_duration", 10)
-        ban_duration = config.get("ban_duration")
-        
-        logger.info(f"⚡ {punishment} → {message.author.name}")
-        
+            seen = {u for u, _, _ in results}
+            for pat in patterns:
+                for match in re.findall(pat, message.content, re.IGNORECASE):
+                    clean = match.split("?")[0]
+                    if clean not in seen:
+                        results.append((clean, "linked_image", 0))
+                        seen.add(clean)
+
+        return results
+
+    # ── Action helpers ────────────────────────────────────────────────────────
+
+    async def _punish_user(
+        self, member: discord.Member, reason: str, cfg: dict
+    ) -> None:
+        punishment = cfg.get("punishment", "timeout")
+        duration = cfg.get("timeout_duration", 10)
+        ban_duration = cfg.get("ban_duration")
+
         try:
             if punishment == "kick":
-                await message.author.kick(reason=f"AI: {reason}")
-                await self.log_action(message.author, "Kick", reason)
-            
+                await member.kick(reason=f"AI: {reason}")
+                await self._log_action(member, "Kick", reason)
             elif punishment == "ban":
-                if ban_duration:
-                    # Temporary ban (delete after X days)
-                    await message.author.ban(reason=f"AI: {reason} (Temp: {ban_duration}d)", delete_message_days=0)
-                else:
-                    # Permanent ban
-                    await message.author.ban(reason=f"AI: {reason}")
-                await self.log_action(message.author, "Ban", reason)
-            
+                ban_reason = f"AI: {reason}" + (f" (Temp: {ban_duration}d)" if ban_duration else "")
+                await member.ban(reason=ban_reason, delete_message_days=0)
+                await self._log_action(member, "Ban", reason)
             elif punishment == "timeout":
-                await message.author.timeout(
-                    discord.utils.utcnow() + timedelta(minutes=duration),
-                    reason=f"AI: {reason}"
-                )
-                await self.log_action(message.author, "Timeout", reason)
-            
+                until = discord.utils.utcnow() + timedelta(minutes=duration)
+                await member.timeout(until, reason=f"AI: {reason}")
+                await self._log_action(member, "Timeout", reason)
             elif punishment == "none":
-                # Just delete and log, no punishment
-                await self.log_action(message.author, "Warning", reason)
-        
+                await self._log_action(member, "Warning", reason)
         except Exception as e:
-            logger.error(f"❌ Punishment failed: {e}")
-    
-    @commands.hybrid_group(invoke_without_command=True, name="scanner", description="NSFW Scanner configuration")
-    @commands.has_permissions(manage_messages=True)
-    async def scanner(self, ctx):
-        """Scanner status and configuration"""
-        if ctx.invoked_subcommand is None:
-            config = self.get_server_config(ctx.guild.id)
-            status = "🟢 Enabled" if config["enabled"] else "🔴 Disabled"
-            
-            # Get log channel
-            log_channel = None
-            if config["log_channel"]:
-                log_channel = ctx.guild.get_channel(int(config["log_channel"]))
-            
-            em = discord.Embed(title="🤖 NSFW Scanner", color=discord.Color.blue())
-            em.add_field(name="Status", value=status, inline=True)
-            em.add_field(name="Threshold", value=f"{config['nsfw_threshold']}%", inline=True)
-            em.add_field(name="Punishment", value=config["punishment"].title(), inline=True)
-            
-            if config["punishment"] == "timeout":
-                minutes = config["timeout_duration"]
-                if minutes >= 1440:
-                    days = minutes // 1440
-                    remaining = minutes % 1440
-                    if remaining == 0:
-                        duration_text = f"{days}d"
-                    else:
-                        hours = remaining // 60
-                        duration_text = f"{days}d {hours}h"
-                elif minutes >= 60:
-                    hours = minutes // 60
-                    remaining = minutes % 60
-                    if remaining == 0:
-                        duration_text = f"{hours}h"
-                    else:
-                        duration_text = f"{hours}h {remaining}m"
-                else:
-                    duration_text = f"{minutes}m"
-                
-                em.add_field(name="Duration", value=duration_text, inline=True)
-            
-            # Test API
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get("http://127.0.0.1:8000/", timeout=3) as resp:
-                        api_status = "🟢 Online" if resp.status == 200 else "🔴 Error"
-            except:
-                api_status = "🔴 Offline"
-            
-            em.add_field(name="API", value=api_status, inline=True)
-            
-            # Log channel
-            log_status = log_channel.mention if log_channel else "Not set"
-            em.add_field(name="Log Channel", value=log_status, inline=True)
-            
-            # Whitelist info
-            whitelisted_roles = config.get("whitelisted_roles", [])
-            if whitelisted_roles:
-                em.add_field(name="Whitelisted Roles", value=f"{len(whitelisted_roles)} role(s)", inline=True)
-            
-            em.add_field(name="Scans", value="Attachments, Embeds, URLs", inline=False)
-            em.set_footer(text="Use /scanner commands to configure")
-            
-            await ctx.send(embed=em)
-    
-    @scanner.command(description="Enable/disable scanner")
-    @commands.has_permissions(manage_messages=True)
-    async def toggle(self, ctx):
-        """Enable/disable scanner"""
-        config = self.get_server_config(ctx.guild.id)
-        config["enabled"] = not config["enabled"]
-        self.save_config()
-        status = "enabled" if config["enabled"] else "disabled"
-        await ctx.send(f"✅ Scanner {status}")
-    
-    @scanner.command(description="Set detection threshold (1-100)")
-    @commands.has_permissions(manage_messages=True)
-    async def threshold(self, ctx, percentage: int):
-        """Set detection threshold (1-100)"""
-        if not 1 <= percentage <= 100:
-            return await ctx.send("❌ Use 1-100", ephemeral=True)
-        
-        config = self.get_server_config(ctx.guild.id)
-        config["nsfw_threshold"] = percentage
-        self.save_config()
-        await ctx.send(f"✅ Threshold: {percentage}%")
-    
-    @scanner.command(description="Set punishment type (none/kick/ban/timeout)")
-    @commands.has_permissions(manage_messages=True)
-    async def punishment(self, ctx, ptype: str):
-        """Set punishment type (none/kick/ban/timeout)"""
-        if ptype.lower() not in ["none", "kick", "ban", "timeout"]:
-            return await ctx.send("❌ Use: none, kick, ban, timeout", ephemeral=True)
-        
-        config = self.get_server_config(ctx.guild.id)
-        config["punishment"] = ptype.lower()
-        self.save_config()
-        await ctx.send(f"✅ Punishment: {ptype.lower()}")
-    
-    @scanner.command(description="Set timeout duration")
-    @commands.has_permissions(manage_messages=True)
-    async def duration(self, ctx, duration: str):
-        """Set timeout duration (e.g., 10m, 2h, 1d, 30s)"""
-        pattern = r'^(\d+)([smhd])$'
-        match = re.match(pattern, duration.lower())
-        
-        if not match:
-            return await ctx.send("❌ Invalid format! Use: `30s`, `10m`, `2h`, or `1d`", ephemeral=True)
-        
-        amount, unit = match.groups()
-        amount = int(amount)
-        
-        if unit == 's':
-            minutes = amount / 60
-            if minutes < 1:
-                minutes = 1
-            else:
-                minutes = int(minutes)
-            display = f"{amount} seconds"
-        elif unit == 'm':
-            minutes = amount
-            display = f"{amount} minutes"
-        elif unit == 'h':
-            minutes = amount * 60
-            display = f"{amount} hours"
-        elif unit == 'd':
-            minutes = amount * 1440
-            display = f"{amount} days"
-        
-        if minutes < 1:
-            return await ctx.send("❌ Minimum duration is 1 minute", ephemeral=True)
-        if minutes > 40320:
-            return await ctx.send("❌ Maximum duration is 28 days", ephemeral=True)
-        
-        config = self.get_server_config(ctx.guild.id)
-        config["timeout_duration"] = int(minutes)
-        self.save_config()
-        
-        await ctx.send(f"✅ Timeout duration set to **{display}** ({int(minutes)} minutes)")
-    
-    @scanner.command(name="logchannel", description="Set log channel for NSFW detections")
-    @commands.has_permissions(manage_messages=True)
-    async def log_channel(self, ctx, channel: discord.TextChannel = None):
-        """Set log channel for NSFW detections"""
-        config = self.get_server_config(ctx.guild.id)
-        
-        if channel is None:
-            config["log_channel"] = None
-            self.save_config()
-            await ctx.send("✅ Log channel disabled")
-        else:
-            config["log_channel"] = channel.id
-            self.save_config()
-            
-            test_embed = discord.Embed(
-                title="✅ Log Channel Configured",
-                description=f"NSFW detection logs will be sent to {channel.mention}",
-                color=discord.Color.green()
-            )
-            await ctx.send(embed=test_embed)
-            
-            welcome_embed = discord.Embed(
-                title="🤖 NSFW Detection System",
-                description="This channel will receive detailed logs when NSFW content is detected and removed.",
-                color=discord.Color.blue()
-            )
-            welcome_embed.add_field(
-                name="What's Logged:",
-                value="• User information\n• Account details\n• Server join date\n• Message content\n• Image preview (spoiler)\n• Remove timeout button",
-                inline=False
-            )
-            await channel.send(embed=welcome_embed)
-    
-    @scanner.command(description="Test API connection")
-    @commands.has_permissions(manage_messages=True)
-    async def test(self, ctx):
-        """Test API connection"""
-        await ctx.send("🔍 Testing API...", ephemeral=True)
+            logger.error("Punishment failed for %s: %s", member, e)
+
+    async def _log_action(self, user: discord.User, action: str, reason: str) -> None:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("http://127.0.0.1:8000/", timeout=5) as resp:
-                    if resp.status == 200:
-                        await ctx.send("✅ API is online and working!", ephemeral=True)
-                    else:
-                        await ctx.send(f"⚠️ API returned status {resp.status}", ephemeral=True)
-        except:
-            await ctx.send("❌ API is offline. Make sure `scanner_api.py` is running!", ephemeral=True)
-    
+            from database import add_modlog
+            await add_modlog(user.id, action, reason, self.bot.user.id)
+        except Exception as e:
+            logger.warning("DB log failed: %s", e)
+
+    async def _send_dm(
+        self, user: discord.User, guild_name: str
+    ) -> None:
+        try:
+            embed = discord.Embed(
+                title="📋 Content Removed",
+                description=(
+                    f"Hey! A file you posted in **{guild_name}** was automatically removed "
+                    f"because it appears to contain content that violates the server's "
+                    f"explicit content policy.\n\n"
+                    f"If you believe this was a mistake, please contact a server moderator."
+                ),
+                color=0xF59E0B,
+            )
+            embed.set_footer(text="This is an automated message from the moderation system.")
+            await user.send(embed=embed)
+        except discord.Forbidden:
+            pass  # DMs disabled
+        except Exception as e:
+            logger.warning("Failed to DM user %s: %s", user, e)
+
+    async def _send_log_embed(
+        self,
+        message: discord.Message,
+        scan_result,
+        file_info: list[tuple[str, str, int]],
+        verdict: str,
+        cfg: dict,
+    ) -> None:
+        """Send a detailed log embed to the configured log channel."""
+        log_channel_id = cfg.get("log_channel")
+        if not log_channel_id:
+            return
+
+        log_channel = message.guild.get_channel(int(log_channel_id))
+        if not log_channel:
+            return
+
+        member = message.author
+        now = discord.utils.utcnow()
+        color = 0xFF4444 if verdict == "BLOCK" else 0xFFA500
+
+        title = (
+            "🚨 NSFW Content Detected — BLOCKED"
+            if verdict == "BLOCK"
+            else "⚠️ [REVIEW NEEDED] Possible NSFW Content"
+        )
+
+        embed = discord.Embed(title=title, color=color, timestamp=now)
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+        embed.add_field(name="User", value=f"{member.mention} (`{member.id}`)", inline=True)
+        embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+        embed.add_field(name="Message ID", value=f"`{message.id}`", inline=True)
+
+        acct_ts = int(member.created_at.timestamp())
+        embed.add_field(
+            name="👤 Account",
+            value=f"**Created:** <t:{acct_ts}:R>\n**Name:** {member.name}",
+            inline=True,
+        )
+
+        if member.joined_at:
+            join_ts = int(member.joined_at.timestamp())
+            embed.add_field(
+                name="🏠 Server",
+                value=f"**Joined:** <t:{join_ts}:R>",
+                inline=True,
+            )
+
+        # AI detection info
+        embed.add_field(
+            name="🤖 AI Detection",
+            value=(
+                f"**Verdict:** `{scan_result.verdict}`\n"
+                f"**Reason:** {scan_result.reason}\n"
+                f"**Branch:** {scan_result.branch}\n"
+                f"**Model:** {scan_result.model}\n"
+                f"**Time:** {scan_result.processing_time_ms:.0f}ms"
+                + (f"\n**Frame:** #{scan_result.frame_index}" if scan_result.frame_index is not None else "")
+            ),
+            inline=False,
+        )
+
+        if message.content:
+            embed.add_field(
+                name="💬 Message",
+                value=message.content[:512],
+                inline=False,
+            )
+
+        if file_info:
+            lines = []
+            for url, fname, size in file_info[:5]:
+                size_str = f" `({size:,} bytes)`" if size else ""
+                lines.append(f"[{fname}]({url}){size_str}")
+            embed.add_field(name="📎 Attachments", value="\n".join(lines), inline=False)
+
+        embed.set_footer(text="NSFW Detection System • Local AI Pipeline")
+
+        view = None
+        if verdict == "BLOCK" and cfg.get("punishment") == "timeout":
+            view = RemoveTimeoutView(member.id)
+
+        log_msg = await log_channel.send(embed=embed, view=view)
+
+        # Send image preview as spoiler
+        if file_info:
+            try:
+                first_url, first_fname, _ = file_info[0]
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(first_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            preview_file = discord.File(
+                                fp=BytesIO(data),
+                                filename=f"SPOILER_{first_fname}",
+                                spoiler=True,
+                            )
+                            preview_embed = discord.Embed(
+                                description="⚠️ **Flagged Content Preview** (Click to reveal)",
+                                color=0xFF0000,
+                            )
+                            await log_channel.send(embed=preview_embed, file=preview_file)
+            except Exception as e:
+                logger.debug("Could not send image preview: %s", e)
+
+    # ── Main listener ─────────────────────────────────────────────────────────
+
     @commands.Cog.listener()
-    async def on_message(self, message):
-        """Main scanner - monitors all messages for images"""
+    async def on_message(self, message: discord.Message) -> None:
+        """Scan incoming messages for NSFW media."""
         try:
             if message.author.bot or not message.guild:
                 return
-            
-            config = self.get_server_config(message.guild.id)
-            if not config["enabled"]:
-                return
-            
-            # Check whitelist - roles
-            if config.get("whitelisted_roles"):
-                member_role_ids = [role.id for role in message.author.roles]
-                if any(role_id in config["whitelisted_roles"] for role_id in member_role_ids):
-                    logger.info(f"✅ {message.author.name} is whitelisted (role)")
-                    return
-            
-            # Check whitelist - users
-            if message.author.id in config.get("whitelisted_users", []):
-                logger.info(f"✅ {message.author.name} is whitelisted (user)")
-                return
-            
-            urls, sources, file_info = self.extract_image_urls(message)
-            if not urls:
-                return
-            
-            logger.info(f"📎 {message.author.name} → {len(urls)} image(s) detected")
-            
-            results = await self.check_image_content(urls)
-            if not results:
-                return
-            
-            violations = []
-            flagged_files = []
-            
-            for i, result in enumerate(results):
-                if result.get("is_nsfw") and result.get("confidence_percentage", 0) >= config["nsfw_threshold"]:
-                    violations.append(f"{sources[i]} ({result['confidence_percentage']}%)")
-                    if i < len(file_info):
-                        flagged_files.append(file_info[i])
-            
-            if violations:
-                logger.info(f"🚨 FLAGGED: {len(violations)} violation(s)")
-                
-                # Log to channel BEFORE deleting (pass violations data)
-                await self.send_log_to_channel(message, flagged_files, config["punishment"], violations)
-                
-                try:
-                    await message.delete()
-                    logger.info("🗑️ Deleted")
-                except:
-                    pass
-                
-                await self.punish_user(message, f"NSFW content detected", config)
-                
-                try:
-                    em = discord.Embed(
-                        title="🚨 Content Removed",
-                        description=f"Your content in **{message.guild.name}** was flagged by AI",
-                        color=discord.Color.red()
-                    )
-                    em.add_field(name="Reason", value="NSFW content detected", inline=False)
-                    em.add_field(name="Action", value=f"{config['punishment'].title()}", inline=False)
-                    await message.author.send(embed=em)
-                except:
-                    pass
-            else:
-                logger.info("✅ Clean")
-        
-        except Exception as e:
-            logger.error(f"❌ Error: {e}", exc_info=True)
 
-async def setup(bot):
+            cfg = self.get_server_config(message.guild.id)
+            if not cfg.get("enabled", True):
+                return
+
+            # Check channel monitoring
+            from config import config as bot_config
+
+            # Use the bot_config monitored_channels if set, otherwise use per-guild config
+            if not bot_config.monitor_all and bot_config.monitored_channels:
+                if message.channel.id not in bot_config.monitored_channels:
+                    return
+
+            # Check whitelist — roles
+            member_role_ids = [r.id for r in message.author.roles]
+            if any(rid in cfg.get("whitelisted_roles", []) for rid in member_role_ids):
+                return
+
+            # Check whitelist — users
+            if message.author.id in cfg.get("whitelisted_users", []):
+                return
+
+            # Extract media
+            media_list = self.extract_media_urls(message)
+            if not media_list:
+                return
+
+            logger.info(
+                "📎 %s posted %d media item(s) in #%s",
+                message.author,
+                len(media_list),
+                message.channel.name,
+            )
+
+            # Per-guild lock to prevent concurrent GPU inference
+            async with self._guild_lock(message.guild.id):
+                from moderation.pipeline import scan_attachment
+
+                best_result = None
+                best_file_info = None
+
+                for url, fname, size in media_list:
+                    try:
+                        result = await scan_attachment(url, bot_config)
+                    except Exception as e:
+                        logger.error("Pipeline error for %s: %s", url, e, exc_info=True)
+                        continue
+
+                    logger.info(
+                        "🔍 [%s] %s → %s (%s)",
+                        message.author.name,
+                        fname,
+                        result.verdict,
+                        result.reason,
+                    )
+
+                    if best_result is None or _SEVERITY.get(result.verdict, 0) > _SEVERITY.get(best_result.verdict, 0):
+                        best_result = result
+                        best_file_info = [(url, fname, size)]
+
+                    if result.verdict == "BLOCK":
+                        break  # Stop processing on first block
+
+                if best_result is None or best_result.verdict == "SAFE":
+                    return
+
+                # Take action based on verdict
+                file_info = best_file_info or []
+
+                if best_result.verdict == "BLOCK":
+                    # Delete message
+                    try:
+                        await message.delete()
+                        logger.info("🗑️ Deleted message from %s", message.author)
+                    except Exception as e:
+                        logger.warning("Could not delete message: %s", e)
+
+                    # DM user
+                    await self._send_dm(message.author, message.guild.name)
+
+                    # Punish
+                    try:
+                        member = message.guild.get_member(message.author.id)
+                        if member:
+                            await self._punish_user(member, best_result.reason, cfg)
+                    except Exception as e:
+                        logger.error("Punishment error: %s", e)
+
+                    # Log
+                    await self._send_log_embed(message, best_result, file_info, "BLOCK", cfg)
+
+                elif best_result.verdict == "REVIEW":
+                    # Do NOT delete — just log for human review
+                    await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
+                    logger.info(
+                        "⚠️ REVIEW flagged for %s in #%s",
+                        message.author,
+                        message.channel.name,
+                    )
+
+        except Exception as e:
+            logger.error("AutoMod on_message error: %s", e, exc_info=True)
+
+    # ── Legacy scanner commands (preserved for backwards compatibility) ────────
+
+    @commands.hybrid_group(invoke_without_command=True, name="scanner", description="NSFW Scanner configuration")
+    @commands.has_permissions(manage_messages=True)
+    async def scanner(self, ctx: commands.Context) -> None:
+        if ctx.invoked_subcommand is None:
+            cfg = self.get_server_config(ctx.guild.id)
+            status = "🟢 Enabled" if cfg["enabled"] else "🔴 Disabled"
+
+            log_channel = None
+            if cfg["log_channel"]:
+                log_channel = ctx.guild.get_channel(int(cfg["log_channel"]))
+
+            em = discord.Embed(title="🤖 NSFW Scanner (Local AI)", color=discord.Color.blue())
+            em.add_field(name="Status", value=status, inline=True)
+            em.add_field(name="Threshold", value=f"{cfg['nsfw_threshold']}%", inline=True)
+            em.add_field(name="Punishment", value=cfg["punishment"].title(), inline=True)
+            em.add_field(name="Engine", value="Local AI Pipeline (4-model council)", inline=True)
+            em.add_field(name="Log Channel", value=log_channel.mention if log_channel else "Not set", inline=True)
+            em.set_footer(text="Use /scanner commands to configure | /nsfw for new slash commands")
+            await ctx.send(embed=em)
+
+    @scanner.command(description="Enable/disable scanner")
+    @commands.has_permissions(manage_messages=True)
+    async def toggle(self, ctx: commands.Context) -> None:
+        cfg = self.get_server_config(ctx.guild.id)
+        cfg["enabled"] = not cfg["enabled"]
+        self.save_config()
+        await ctx.send(f"✅ Scanner {'enabled' if cfg['enabled'] else 'disabled'}")
+
+    @scanner.command(description="Set detection threshold (1-100)")
+    @commands.has_permissions(manage_messages=True)
+    async def threshold(self, ctx: commands.Context, percentage: int) -> None:
+        if not 1 <= percentage <= 100:
+            return await ctx.send("❌ Use 1-100", ephemeral=True)
+        cfg = self.get_server_config(ctx.guild.id)
+        cfg["nsfw_threshold"] = percentage
+        self.save_config()
+        await ctx.send(f"✅ Threshold: {percentage}%")
+
+    @scanner.command(description="Set punishment type (none/kick/ban/timeout)")
+    @commands.has_permissions(manage_messages=True)
+    async def punishment(self, ctx: commands.Context, ptype: str) -> None:
+        if ptype.lower() not in ["none", "kick", "ban", "timeout"]:
+            return await ctx.send("❌ Use: none, kick, ban, timeout", ephemeral=True)
+        cfg = self.get_server_config(ctx.guild.id)
+        cfg["punishment"] = ptype.lower()
+        self.save_config()
+        await ctx.send(f"✅ Punishment: {ptype.lower()}")
+
+    @scanner.command(name="logchannel", description="Set log channel for NSFW detections")
+    @commands.has_permissions(manage_messages=True)
+    async def log_channel(self, ctx: commands.Context, channel: discord.TextChannel = None) -> None:
+        cfg = self.get_server_config(ctx.guild.id)
+        if channel is None:
+            cfg["log_channel"] = None
+            self.save_config()
+            await ctx.send("✅ Log channel disabled")
+        else:
+            cfg["log_channel"] = channel.id
+            self.save_config()
+            em = discord.Embed(
+                title="✅ Log Channel Set",
+                description=f"NSFW detection logs will be sent to {channel.mention}",
+                color=discord.Color.green(),
+            )
+            await ctx.send(embed=em)
+
+
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AutoMod(bot))

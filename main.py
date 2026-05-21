@@ -1,109 +1,142 @@
-import discord
-from discord.ext import commands
-import os
-from dotenv import load_dotenv
+"""
+main.py — Bot entry point.
+
+Loads BotConfig from .env, initializes the bot with all cogs,
+syncs slash commands to configured guilds on startup.
+"""
+
 import asyncio
 import logging
+import time
 
+import discord
+from discord.ext import commands
 
-# Load environment variables
-load_dotenv()
-TOKEN = os.getenv('TOKEN')
-PREFIX = os.getenv('PREFIX', ';')
-
-if not TOKEN:
-    logger.error("TOKEN not found in environment variables!")
-    raise ValueError("No TOKEN found in .env file")
-
-
-# Set up logging
+# ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(levelname)s:%(name)s: %(message)s'
+    format="%(levelname)s:%(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# ── Config ────────────────────────────────────────────────────────────────────
+from config import config
 
-# CRITICAL: Enable all necessary intents
+# ── Intents ───────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True  # MUST BE ENABLED for attachments
+intents.message_content = True   # Required for reading attachment content types
 intents.messages = True
 intents.guilds = True
 intents.members = True
 
-
-# Create bot
+# ── Bot ───────────────────────────────────────────────────────────────────────
 bot = commands.Bot(
-    command_prefix=PREFIX,
+    command_prefix=config.prefix,
     intents=intents,
-    help_command=None
+    help_command=None,
 )
 
 
+# ── on_message passthrough (allows cog listeners + prefix commands) ───────────
 @bot.event
-async def on_ready():
-    logger.info(f'✅ {bot.user.name} has connected to Discord!')
-    logger.info(f'📊 Bot is in {len(bot.guilds)} guilds')
-    logger.info(f'🔐 Message Content Intent: {intents.message_content}')
-
-
-# CRITICAL: This allows on_message listeners in cogs to work
-@bot.event
-async def on_message(message):
-    # Don't process bot messages
+async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
-    
-    # Process commands first (this allows ; commands to work)
     await bot.process_commands(message)
 
 
-# Load all cogs
-async def load_cogs():
-    cogs = [
-        'cogs.info',
-        'cogs.utility',
-        'cogs.fun',
-        'cogs.moderation',
-        'cogs.automod',
-        'cogs.automod_setup',
-        'cogs.tasks',
-        'cogs.errors'  # Global error handling
-    ]
-    for cog in cogs:
+# ── Cog loader ────────────────────────────────────────────────────────────────
+COGS = [
+    # Existing cogs (unchanged)
+    "cogs.info",
+    "cogs.utility",
+    "cogs.fun",
+    "cogs.moderation",
+    "cogs.automod",         # Rewritten — now uses local AI pipeline
+    "cogs.automod_setup",   # Setup wizard (unchanged)
+    "cogs.tasks",
+    "cogs.errors",
+    # New NSFW admin slash commands
+    "bot.cogs.admin",
+]
+
+
+async def load_cogs() -> None:
+    for cog in COGS:
         try:
             await bot.load_extension(cog)
-            logger.info(f'✅ Loaded {cog}')
+            logger.info("✅ Loaded %s", cog)
         except Exception as e:
-            logger.error(f'❌ Failed to load {cog}: {e}')
+            logger.error("❌ Failed to load %s: %s", cog, e)
 
 
-async def main():
-    import time
-    from database import init_db_pool, close_db
-    
+# ── on_ready ──────────────────────────────────────────────────────────────────
+@bot.event
+async def on_ready() -> None:
+    logger.info("✅ %s connected to Discord!", bot.user.name)
+    logger.info("📊 Serving %d guild(s)", len(bot.guilds))
+    logger.info("🔐 Message Content Intent: %s", intents.message_content)
+
+    # Sync slash commands to configured guilds
+    if config.guild_ids:
+        for guild_id in config.guild_ids:
+            guild_obj = discord.Object(id=guild_id)
+            try:
+                bot.tree.copy_global_to(guild=guild_obj)
+                synced = await bot.tree.sync(guild=guild_obj)
+                logger.info("🔄 Synced %d slash commands to guild %s", len(synced), guild_id)
+            except Exception as e:
+                logger.warning("Could not sync commands to guild %s: %s", guild_id, e)
+    else:
+        # Global sync (takes up to 1 hour to propagate)
+        try:
+            synced = await bot.tree.sync()
+            logger.info("🔄 Synced %d slash commands globally", len(synced))
+        except Exception as e:
+            logger.warning("Global command sync failed: %s", e)
+
+    # Log monitored channels
+    if config.monitor_all:
+        logger.info("👁️  Monitoring: ALL channels")
+    elif config.monitored_channels:
+        logger.info("👁️  Monitoring channels: %s", config.monitored_channels)
+    else:
+        logger.info("👁️  No channels pre-configured — use /nsfw enable #channel")
+
+
+# ── on_error ──────────────────────────────────────────────────────────────────
+@bot.event
+async def on_error(event: str, *args, **kwargs) -> None:
+    logger.exception("Unhandled error in event %s", event)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+async def main() -> None:
     bot.start_time = time.time()
-    
-    # Initialize Database
+
+    # Initialize database (SQLite — creates bot.db in the project directory)
     try:
+        from database import init_db_pool
         await init_db_pool()
     except Exception as e:
-        logger.critical(f"Failed to connect to database: {e}")
-        return
+        logger.warning("Database init warning (bot will still start): %s", e)
 
     async with bot:
         await load_cogs()
         try:
-            await bot.start(TOKEN)
+            await bot.start(config.discord_token)
         except KeyboardInterrupt:
-            # Handle user interrupt
             pass
         finally:
-            await close_db()
+            try:
+                from database import close_db
+                await close_db()
+            except Exception:
+                pass
             logger.info("Bot shutdown complete.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -1,161 +1,180 @@
-# database.py
-import asyncpg
+# database.py — SQLite backend (replaces PostgreSQL/asyncpg)
+#
+# Uses Python's built-in sqlite3 via aiosqlite for async access.
+# No external database server required — the DB is a single file: bot.db
+#
+# Drop-in replacement: all function signatures are identical to the
+# previous asyncpg version so no other files need to change.
+
+import aiosqlite
 import os
 import logging
-import json
 from datetime import datetime
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("database")
 
-pool = None
+DB_PATH = os.getenv("SQLITE_DB_PATH", "./bot.db")
+
+# Module-level connection (reused across calls)
+_db: aiosqlite.Connection | None = None
+
 
 async def init_db_pool():
-    """Initialize the PostgreSQL connection pool."""
-    global pool
+    """Open the SQLite connection and create tables if they don't exist."""
+    global _db
     try:
-        # Get credentials from env, or use defaults
-        user = os.getenv("POSTGRES_USER", "postgres")
-        password = os.getenv("POSTGRES_PASSWORD", "password")
-        database = os.getenv("POSTGRES_DB", "nsfwscanner")
-        host = os.getenv("POSTGRES_HOST", "localhost")
-        port = os.getenv("POSTGRES_PORT", "5432")
-
-        dsn = f"postgresql://{user}:{password}@{host}:{port}/{database}"
-        
-        pool = await asyncpg.create_pool(dsn)
-        logger.info("✅ Connected to PostgreSQL!")
-        
-        # Initialize tables
+        _db = await aiosqlite.connect(DB_PATH)
+        _db.row_factory = aiosqlite.Row   # allows dict-style access
+        await _db.execute("PRAGMA journal_mode=WAL")   # safe for concurrent reads
+        await _db.execute("PRAGMA foreign_keys=ON")
         await init_tables()
-        
+        logger.info("✅ Connected to SQLite: %s", os.path.abspath(DB_PATH))
     except Exception as e:
-        logger.error(f"❌ Failed to connect to PostgreSQL: {e}")
-        # Re-raise so bot doesn't start without DB if it's critical
-        raise e
+        logger.error("❌ Failed to open SQLite database: %s", e)
+        raise
 
-async def get_db():
-    """Get the connection pool."""
-    if not pool:
+
+async def get_db() -> aiosqlite.Connection:
+    """Return the active database connection, opening it if needed."""
+    global _db
+    if _db is None:
         await init_db_pool()
-    return pool
+    return _db
+
 
 async def init_tables():
     """Create necessary tables if they don't exist."""
-    async with pool.acquire() as conn:
-        # modlogs table
-        await conn.execute("""
+    db = await get_db()
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS modlogs (
-            case_id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            action TEXT,
-            reason TEXT,
-            moderator_id BIGINT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-        
-        # scheduled actions table
-        await conn.execute("""
+            case_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            action      TEXT    NOT NULL,
+            reason      TEXT    NOT NULL,
+            moderator_id INTEGER NOT NULL,
+            timestamp   TEXT    DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+        )
+    """)
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS scheduled (
-            id SERIAL PRIMARY KEY,
-            guild_id BIGINT,
-            user_id BIGINT,
-            action TEXT,
-            execute_at_ts BIGINT,
-            extra TEXT
-        );
-        """)
-        logger.info("✅ Database tables initialized.")
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id        INTEGER NOT NULL,
+            user_id         INTEGER NOT NULL,
+            action          TEXT    NOT NULL,
+            execute_at_ts   INTEGER NOT NULL,
+            extra           TEXT
+        )
+    """)
+    await db.commit()
+    logger.info("✅ Database tables initialized (SQLite)")
+
 
 async def close_db():
-    """Close the connection pool."""
-    if pool:
-        await pool.close()
-        logger.info("👋 Database connection closed.")
+    """Close the SQLite connection."""
+    global _db
+    if _db is not None:
+        await _db.close()
+        _db = None
+        logger.info("👋 SQLite connection closed.")
 
-# --- Modlogs Helpers ---
 
-async def add_modlog(user_id: int, action: str, reason: str, moderator_id: int):
-    """Add a moderation log entry."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO modlogs (user_id, action, reason, moderator_id, timestamp)
-            VALUES ($1, $2, $3, $4, NOW())
-            RETURNING case_id
-            """,
-            user_id, action, reason, moderator_id
-        )
-        return row['case_id']
+# ── Modlogs helpers ────────────────────────────────────────────────────────────
 
-async def get_modlogs(user_id: int):
-    """Get all modlogs for a user."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT case_id, user_id, action, reason, moderator_id, 
-                   to_char(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp_str
-            FROM modlogs 
-            WHERE user_id = $1 
-            ORDER BY case_id ASC
-            """,
-            user_id
-        )
-        # Convert record objects to list of tuples for compatibility
-        return [(r['case_id'], r['user_id'], r['action'], r['reason'], r['moderator_id'], r['timestamp_str']) for r in rows]
+async def add_modlog(user_id: int, action: str, reason: str, moderator_id: int) -> int:
+    """Insert a moderation log entry and return the new case_id."""
+    db = await get_db()
+    cursor = await db.execute(
+        """
+        INSERT INTO modlogs (user_id, action, reason, moderator_id)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, action, reason, moderator_id),
+    )
+    await db.commit()
+    return cursor.lastrowid
 
-async def get_case(case_id: int):
-    """Get a specific case by ID."""
-    async with pool.acquire() as conn:
-        r = await conn.fetchrow(
-            """
-            SELECT case_id, user_id, action, reason, moderator_id, 
-                   to_char(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp_str
-            FROM modlogs 
-            WHERE case_id = $1
-            """,
-            case_id
-        )
-        if r:
-            return (r['case_id'], r['user_id'], r['action'], r['reason'], r['moderator_id'], r['timestamp_str'])
-        return None
 
-async def clear_warns(user_id: int):
-    """Clear warning logs for a user."""
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM modlogs WHERE user_id = $1 AND action = 'Warn'",
-            user_id
-        )
+async def get_modlogs(user_id: int) -> list[tuple]:
+    """Return all modlogs for a user as a list of (case_id, user_id, action, reason, moderator_id, timestamp)."""
+    db = await get_db()
+    async with db.execute(
+        """
+        SELECT case_id, user_id, action, reason, moderator_id, timestamp
+        FROM modlogs
+        WHERE user_id = ?
+        ORDER BY case_id ASC
+        """,
+        (user_id,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return [tuple(r) for r in rows]
 
-# --- Scheduled Actions Helpers ---
 
-async def add_scheduled(guild_id: int, user_id: int, action: str, execute_at_ts: int, extra: str = None):
-    """Add a scheduled action."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO scheduled (guild_id, user_id, action, execute_at_ts, extra)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-            """,
-            guild_id, user_id, action, execute_at_ts, extra
-        )
-        return row['id']
+async def get_case(case_id: int) -> tuple | None:
+    """Return a single modlog entry by case_id, or None if not found."""
+    db = await get_db()
+    async with db.execute(
+        """
+        SELECT case_id, user_id, action, reason, moderator_id, timestamp
+        FROM modlogs
+        WHERE case_id = ?
+        """,
+        (case_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return tuple(row) if row else None
 
-async def get_due_scheduled(now_ts: int):
-    """Get actions that are due to be executed."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, guild_id, user_id, action, execute_at_ts, extra FROM scheduled WHERE execute_at_ts <= $1",
-            now_ts
-        )
-        # Convert to list of tuples/objects as expected by consumer
-        return [(r['id'], r['guild_id'], r['user_id'], r['action'], r['execute_at_ts'], r['extra']) for r in rows]
 
-async def remove_scheduled_by_id(sched_id: int):
-    """Remove a scheduled action by ID."""
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM scheduled WHERE id = $1", sched_id)
+async def clear_warns(user_id: int) -> None:
+    """Delete all 'Warn' entries for a user."""
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM modlogs WHERE user_id = ? AND action = 'Warn'",
+        (user_id,),
+    )
+    await db.commit()
+
+
+# ── Scheduled actions helpers ──────────────────────────────────────────────────
+
+async def add_scheduled(
+    guild_id: int,
+    user_id: int,
+    action: str,
+    execute_at_ts: int,
+    extra: str | None = None,
+) -> int:
+    """Schedule an action and return its id."""
+    db = await get_db()
+    cursor = await db.execute(
+        """
+        INSERT INTO scheduled (guild_id, user_id, action, execute_at_ts, extra)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (guild_id, user_id, action, execute_at_ts, extra),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def get_due_scheduled(now_ts: int) -> list[tuple]:
+    """Return all scheduled actions whose execute_at_ts <= now_ts."""
+    db = await get_db()
+    async with db.execute(
+        """
+        SELECT id, guild_id, user_id, action, execute_at_ts, extra
+        FROM scheduled
+        WHERE execute_at_ts <= ?
+        """,
+        (now_ts,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return [tuple(r) for r in rows]
+
+
+async def remove_scheduled_by_id(sched_id: int) -> None:
+    """Delete a scheduled action by its id."""
+    db = await get_db()
+    await db.execute("DELETE FROM scheduled WHERE id = ?", (sched_id,))
+    await db.commit()

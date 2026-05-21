@@ -1,10 +1,31 @@
-discord.py
-python-dotenv
-aiohttp
-Pillow
-fastapi
-uvicorn
-transformers
-torch
-timm
-asyncpg
+# requirements.txt — NSFW Moderation Discord Bot
+# Install: pip install -r requirements.txt
+
+# Discord
+discord.py>=2.3.0
+
+# ML / Inference
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.40.0
+onnxruntime>=1.17.0
+nudenet>=3.4.0
+huggingface_hub>=0.20.0
+
+# Image / Video processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+imageio[ffmpeg]>=2.33.0
+
+# Config / Env
+python-dotenv>=1.0.0
+
+# HTTP / Async
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+
+# Database (SQLite — no install needed, file is bot.db)
+aiosqlite>=0.20.0
+
+# Utilities
+timm>=0.9.0
