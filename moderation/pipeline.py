@@ -289,10 +289,10 @@ async def scan_attachment(
 
             # Stage 0: Pre-filter
             prefilter_score = await asyncio.to_thread(_prefilter.score, frame)
-            worth_checking = prefilter_score >= 0.25 or bypass_prefilter
+            worth_checking = prefilter_score >= 0.15 or bypass_prefilter
 
             verdict_text = "Passed to Gatekeeper Router"
-            if not (prefilter_score >= 0.25):
+            if not (prefilter_score >= 0.15):
                 if bypass_prefilter:
                     verdict_text = "Passed to Gatekeeper Router (Forced via Test Mode)"
                 else:
@@ -303,7 +303,7 @@ async def scan_attachment(
                 f"  Model: AdamCodd/vit-base-nsfw-detector (ONNX CPU)\n"
                 f"  Resolution: {w}x{h}\n"
                 f"  NSFW Score: {prefilter_score:.4f}\n"
-                f"  Threshold: 0.25\n"
+                f"  Threshold: 0.15\n"
                 f"  Verdict: {verdict_text}"
             )
 
@@ -381,9 +381,9 @@ async def scan_attachment(
                     f"    - suggestive_score: {sugg_sc:.4f}\n"
                     f"    - Formula: ({wdv3_exp:.4f} * 0.30) + ({ar_r18:.4f} * 0.25) + ({gen_sc:.4f} * 0.30) + ({breast_sc:.4f} * 0.15) = {fin_sc:.4f}\n"
                     f"  Decision Tiers:\n"
-                    f"    - EXPLICIT: genital_score >= 0.80\n"
-                    f"    - NSFW: breast_score >= 0.75\n"
-                    f"    - SUGGESTIVE: fused score >= 0.65\n"
+                    f"    - EXPLICIT: genital_score >= 0.60\n"
+                    f"    - NSFW: breast_score >= 0.60\n"
+                    f"    - SUGGESTIVE: fused score >= 0.50\n"
                     f"    - SAFE: otherwise\n"
                     f"  Detected Explicit Tags: {tags_str}\n"
                     f"  Tagger Rating: {getattr(branch_result, 'rating', 'unknown')}\n"

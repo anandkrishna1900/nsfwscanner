@@ -21,32 +21,41 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 GENITAL_TAGS: Dict[str, float] = {
-    "penis": 0.72,
-    "vagina": 0.75,
-    "pussy": 0.75,
-    "genitals": 0.80,
-    "testicles": 0.72,
-    "erection": 0.70,
-    "anus": 0.72,
-    "phallus": 0.72,
+    "penis": 0.50,
+    "vagina": 0.50,
+    "pussy": 0.50,
+    "genitals": 0.55,
+    "testicles": 0.50,
+    "erection": 0.48,
+    "anus": 0.50,
+    "phallus": 0.50,
+    "cum": 0.55,
+    "sex": 0.55,
+    "rape": 0.52,
+    "nude": 0.55,
+    "naked": 0.55,
 }
 
 BREAST_TAGS: Dict[str, float] = {
-    "nipples": 0.70,
-    "bare_breasts": 0.72,
-    "breasts_out": 0.75,
-    "areola_slip": 0.72,
-    "nipple_slip": 0.72,
-    "breast_slip": 0.72,
-    "one_breast_out": 0.72,
-    "topless": 0.68,
-    "large_areolae": 0.70,
-    "dark_areolae": 0.70,
-    "light_areolae": 0.70,
-    "puffy_nipples": 0.70,
-    "huge_nipples": 0.70,
-    "dark_nipples": 0.70,
-    "colored_nipples": 0.70,
+    "nipples": 0.50,
+    "bare_breasts": 0.50,
+    "breasts_out": 0.52,
+    "areola_slip": 0.50,
+    "nipple_slip": 0.50,
+    "breast_slip": 0.50,
+    "one_breast_out": 0.50,
+    "topless": 0.50,
+    "large_areolae": 0.52,
+    "dark_areolae": 0.52,
+    "light_areolae": 0.52,
+    "puffy_nipples": 0.52,
+    "huge_nipples": 0.52,
+    "dark_nipples": 0.52,
+    "colored_nipples": 0.52,
+    "nipple_tweak": 0.52,
+    "exposed_breasts": 0.50,
+    "breast_out": 0.50,
+    "breast_grab": 0.55,
 }
 
 SAFE_CONTEXT_TAGS: Dict[str, float] = {
@@ -360,7 +369,7 @@ class AnimeBranch:
     def calculate_breast_score(self, tag_scores: Dict[str, float]) -> float:
         raw_score = self._threshold_score(tag_scores, self.BREAST_TAGS, "breast")
         if raw_score > 0.0:
-            return max(raw_score, 0.75)
+            return max(raw_score, 0.60)
         return 0.0
 
     def calculate_suggestive_score(self, tag_scores: Dict[str, float]) -> float:
@@ -468,11 +477,11 @@ class AnimeBranch:
                 breast_score,
             )
 
-            if genital_score >= 0.80:
+            if genital_score >= 0.60:
                 verdict = "EXPLICIT"
-            elif breast_score >= 0.75:
+            elif breast_score >= 0.60:
                 verdict = "NSFW"
-            elif final_score >= 0.65:
+            elif final_score >= 0.50:
                 verdict = "SUGGESTIVE"
             else:
                 verdict = "SAFE"

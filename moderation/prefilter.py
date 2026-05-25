@@ -2,7 +2,7 @@
 moderation/prefilter.py — Stage 0: AdamCodd ViT NSFW pre-filter (always loaded).
 
 Fast binary safe/nsfw ONNX model that runs on CPU.
-If score < 0.25, skip all further processing (only obviously safe content).
+If score < 0.15, skip all further processing (only obviously safe content).
 """
 
 from __future__ import annotations
@@ -139,7 +139,7 @@ class AdamCoddPrefilter:
         logger.debug("[Prefilter] NSFW score: %.4f", nsfw_prob)
         return float(nsfw_prob)
 
-    def is_worth_checking(self, image: Image.Image, threshold: float = 0.25) -> bool:
+    def is_worth_checking(self, image: Image.Image, threshold: float = 0.15) -> bool:
         """
         Return True if the image should be passed to downstream models.
         Returns False (skip) only if obviously safe (score < threshold).
