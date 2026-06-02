@@ -102,6 +102,11 @@ async def on_ready() -> None:
     logger.info("📊 Serving %d guild(s)", len(bot.guilds))
     logger.info("🔐 Message Content Intent: %s", intents.message_content)
 
+    # Prewarm AI models in background
+    from moderation.pipeline import warm_models
+    asyncio.create_task(warm_models(config))
+    logger.info("🔥 Scheduled background model prewarming")
+
     # Register persistent views so buttons survive restarts
     bot.add_view(ModerationFeedbackView())
     logger.info("🔘 Registered persistent feedback view")
@@ -233,6 +238,12 @@ async def main() -> None:
         except KeyboardInterrupt:
             pass
         finally:
+            try:
+                from moderation.pipeline import close_session
+                await close_session()
+                logger.info("Cleaned up HTTP sessions.")
+            except Exception as e:
+                logger.warning("Error closing HTTP session: %s", e)
             logger.info("Bot shutdown complete.")
 
 

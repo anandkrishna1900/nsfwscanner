@@ -24,23 +24,8 @@ from discord.ext import commands
 from config import config as bot_config
 from bot.ui.feedback_view import ModerationFeedbackView
 from moderation.feedback_manager import _extract_model_scores, _extract_detected_tags
-
-logger = logging.getLogger(__name__)
-
-_EMBED_FIELD_LIMIT = 1024
-
-
-# ── Verdict severity helper ────────────────────────────────────────────────────
-_SEVERITY = {
-    "SAFE": 0,
-    "SUGGESTIVE": 1,
-    "REVIEW": 1,
-    "NSFW": 2,
-    "BLOCK": 2,
-    "EXPLICIT": 3,
-}
-_BLOCKING_VERDICTS = {"BLOCK", "NSFW", "EXPLICIT"}
-_REVIEW_VERDICTS = {"REVIEW", "SUGGESTIVE"}
+from utils.constants import SEVERITY as _SEVERITY, BLOCKING_VERDICTS as _BLOCKING_VERDICTS, REVIEW_VERDICTS as _REVIEW_VERDICTS
+import contextlib
 
 
 def _trim_embed_value(value: str, limit: int = _EMBED_FIELD_LIMIT) -> str:
@@ -197,6 +182,7 @@ class AutoMod(commands.Cog):
     def save_config(self) -> None:
         import os, tempfile
         dir_name = os.path.dirname(os.path.abspath(self.config_file)) or "."
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
                 "w", dir=dir_name, suffix=".tmp", delete=False
@@ -205,10 +191,11 @@ class AutoMod(commands.Cog):
                 tmp_path = tmp.name
             os.replace(tmp_path, self.config_file)
         except Exception:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
             raise
 
     def get_server_config(self, guild_id: int) -> dict:
@@ -246,6 +233,23 @@ class AutoMod(commands.Cog):
         if guild_id not in self._guild_locks:
             self._guild_locks[guild_id] = asyncio.Lock()
         return self._guild_locks[guild_id]
+
+    @contextlib.asynccontextmanager
+    async def _scan_slot(self, user_id: int):
+        MAX_CONCURRENT_SCANS = 3
+        async with self._user_rate_lock:
+            active = self._user_scan_counts.get(user_id, 0)
+            if active >= MAX_CONCURRENT_SCANS:
+                raise ValueError("Rate limit exceeded")
+            self._user_scan_counts[user_id] = active + 1
+        
+        try:
+            yield
+        finally:
+            async with self._user_rate_lock:
+                self._user_scan_counts[user_id] -= 1
+                if self._user_scan_counts[user_id] <= 0:
+                    self._user_scan_counts.pop(user_id, None)
 
     # ── Image URL extraction ──────────────────────────────────────────────────
 
@@ -926,33 +930,11 @@ class AutoMod(commands.Cog):
             )
 
             # ── Per-user rate limiting ────────────────────────────────────────
-            MAX_CONCURRENT_SCANS = 3
             uid = message.author.id
-            async with self._user_rate_lock:
-                active = self._user_scan_counts.get(uid, 0)
-                if active >= MAX_CONCURRENT_SCANS:
-                    # Too many concurrent scans from this user — reject
-                    logger.warning(
-                        "🚫 Rate limit hit for %s (%d active scans)", message.author, active
-                    )
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
-                    try:
-                        await message.author.send(
-                            f"⚠️ **Rate Limit Exceeded:** You have too many concurrent media scans in progress. "
-                            f"Please wait a few seconds before uploading more media."
-                        )
-                    except Exception:
-                        pass
-                    return
-                # Increment inside the same lock — no window for a race
-                self._user_scan_counts[uid] = active + 1
-
             try:
-                # Per-guild lock to prevent concurrent GPU inference
-                async with self._guild_lock(message.guild.id):
+                async with self._scan_slot(uid):
+                    # Per-guild lock to prevent concurrent GPU inference
+                    async with self._guild_lock(message.guild.id):
                     from moderation.pipeline import scan_attachment
                     from utils.database import record_scan
 
@@ -1019,20 +1001,6 @@ class AutoMod(commands.Cog):
 
                         # DM user
                         await self._send_dm(message.author, message.guild.name)
-
-                        # Punish
-                        try:
-                            member = message.guild.get_member(message.author.id)
-                            if member:
-                                await self._punish_user(member, best_result.reason, cfg)
-                        except Exception as e:
-                            logger.error("Punishment error: %s", e)
-
-                        # Log
-                        await self._send_log_embed(message, best_result, file_info, "BLOCK", cfg)
-
-                    elif best_result.verdict in _REVIEW_VERDICTS:
-                        # Do NOT delete — just log for human review
                         await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
                         logger.info(
                             "⚠️ REVIEW flagged for %s in #%s",
@@ -1079,12 +1047,27 @@ class AutoMod(commands.Cog):
                                 message.author,
                                 message.channel.name,
                             )
-            finally:
-                async with self._user_rate_lock:
-                    self._user_scan_counts[uid] = max(0, self._user_scan_counts.get(uid, 1) - 1)
 
         except Exception as e:
             logger.error("AutoMod on_message error: %s", e, exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        """Scan edited messages for new or changed NSFW media to prevent bypasses."""
+        if after.author.bot or not after.guild:
+            return
+
+        # Fast exit if content and attachment URLs are identical
+        before_content = before.content or ""
+        after_content = after.content or ""
+        before_att = {a.url for a in before.attachments}
+        after_att = {a.url for a in after.attachments}
+        
+        if before_content == after_content and before_att == after_att:
+            return
+            
+        logger.debug("Message %s edited by %s. Re-running moderation.", after.id, after.author)
+        await self.on_message(after)
 
     # ── Legacy scanner commands (preserved for backwards compatibility) ────────
 

@@ -46,6 +46,7 @@ def _load_config() -> dict:
 def _save_config(data: dict) -> None:
     import tempfile
     dir_name = os.path.dirname(os.path.abspath(_CONFIG_FILE)) or "."
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
             "w", dir=dir_name, suffix=".tmp", delete=False
@@ -54,10 +55,11 @@ def _save_config(data: dict) -> None:
             tmp_path = tmp.name
         os.replace(tmp_path, _CONFIG_FILE)
     except Exception:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
         raise
 
 

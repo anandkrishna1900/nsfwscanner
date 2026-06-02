@@ -22,15 +22,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Severity ordering for aggregation
-_SEVERITY: dict[str, int] = {
-    "SAFE": 0,
-    "SUGGESTIVE": 1,
-    "REVIEW": 1,
-    "NSFW": 2,
-    "BLOCK": 2,
-    "EXPLICIT": 3,
-}
+from utils.constants import SEVERITY as _SEVERITY
 
 
 @dataclass
@@ -97,13 +89,23 @@ def _ensure_models_initialized(config: "BotConfig") -> None:
 
 # ── Attachment download ────────────────────────────────────────────────────────
 _http_session: Optional[aiohttp.ClientSession] = None
+_session_lock = asyncio.Lock()
 
-def _get_session() -> aiohttp.ClientSession:
-    """Return a shared aiohttp session, creating it on first use."""
+async def _get_session() -> aiohttp.ClientSession:
+    """Return a shared aiohttp session, creating it safely on first use."""
     global _http_session
-    if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession()
-    return _http_session
+    async with _session_lock:
+        if _http_session is None or _http_session.closed:
+            _http_session = aiohttp.ClientSession()
+        return _http_session
+
+async def close_session() -> None:
+    """Close the shared aiohttp session cleanly during shutdown."""
+    global _http_session
+    async with _session_lock:
+        if _http_session is not None and not _http_session.closed:
+            await _http_session.close()
+            _http_session = None
 
 async def _download_attachment(
     url: str,
@@ -118,7 +120,7 @@ async def _download_attachment(
     downloaded = 0
 
     timeout = aiohttp.ClientTimeout(total=60, connect=10)
-    session = _get_session()
+    session = await _get_session()
     async with session.get(url, timeout=timeout) as resp:
         if resp.status != 200:
             raise IOError(f"HTTP {resp.status} when downloading {url}")
@@ -137,6 +139,14 @@ async def _download_attachment(
 
 
 # ── Sync inference helpers (run inside asyncio.to_thread) ─────────────────────
+
+async def warm_models(config: "BotConfig") -> None:
+    """Pre-warm models in a background thread so the first scan is fast."""
+    try:
+        await asyncio.to_thread(_ensure_models_initialized, config)
+        logger.info("[Pipeline] Model pre-warm complete.")
+    except Exception as e:
+        logger.warning("[Pipeline] Model pre-warm failed (non-fatal): %s", e)
 
 def _run_prefilter(image, threshold: float = 0.25) -> bool:
     """Returns True if the image is worth checking (score >= threshold)."""
