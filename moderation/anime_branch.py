@@ -20,7 +20,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-GENITAL_TAGS: Dict[str, float] = {
+# Fallbacks if config is missing
+_DEFAULT_GENITAL_TAGS: Dict[str, float] = {
     "penis": 0.50,
     "vagina": 0.50,
     "pussy": 0.50,
@@ -36,7 +37,7 @@ GENITAL_TAGS: Dict[str, float] = {
     "naked": 0.55,
 }
 
-BREAST_TAGS: Dict[str, float] = {
+_DEFAULT_BREAST_TAGS: Dict[str, float] = {
     "nipples": 0.50,
     "bare_breasts": 0.50,
     "breasts_out": 0.52,
@@ -58,7 +59,7 @@ BREAST_TAGS: Dict[str, float] = {
     "breast_grab": 0.55,
 }
 
-SAFE_CONTEXT_TAGS: Dict[str, float] = {
+_DEFAULT_SAFE_CONTEXT_TAGS: Dict[str, float] = {
     "bikini": 0.15,
     "swimsuit": 0.15,
     "underwear": 0.12,
@@ -71,7 +72,7 @@ SAFE_CONTEXT_TAGS: Dict[str, float] = {
     "micro_bikini": 0.12,
 }
 
-SUGGESTIVE_TAGS: Dict[str, float] = {
+_DEFAULT_SUGGESTIVE_TAGS: Dict[str, float] = {
     "lingerie": 0.62,
     "underboob": 0.60,
     "cameltoe": 0.62,
@@ -104,13 +105,26 @@ class AnimeBranch:
     All inference is synchronous; callers wrap scan() in asyncio.to_thread().
     """
 
-    GENITAL_TAGS = GENITAL_TAGS
-    BREAST_TAGS = BREAST_TAGS
-    SAFE_CONTEXT_TAGS = SAFE_CONTEXT_TAGS
-    SUGGESTIVE_TAGS = SUGGESTIVE_TAGS
-
-    def __init__(self, cache_dir: str) -> None:
+    def __init__(self, cache_dir: str, config=None) -> None:
         self._cache_dir = cache_dir
+        self._config = config
+        
+        # Load from config or use defaults
+        cfg = config.sensitivity.get("anime_branch", {}) if config else {}
+        
+        gen_tags = cfg.get("genital_tags", _DEFAULT_GENITAL_TAGS).copy()
+        breast_tags = cfg.get("breast_tags", _DEFAULT_BREAST_TAGS).copy()
+        sugg_tags = cfg.get("suggestive_tags", _DEFAULT_SUGGESTIVE_TAGS).copy()
+        
+        if config:
+            for k in gen_tags: gen_tags[k] = config.get_threshold(gen_tags[k])
+            for k in breast_tags: breast_tags[k] = config.get_threshold(breast_tags[k])
+            for k in sugg_tags: sugg_tags[k] = config.get_threshold(sugg_tags[k])
+            
+        self.GENITAL_TAGS = gen_tags
+        self.BREAST_TAGS = breast_tags
+        self.SUGGESTIVE_TAGS = sugg_tags
+        self.SAFE_CONTEXT_TAGS = cfg.get("safe_context_tags", _DEFAULT_SAFE_CONTEXT_TAGS)
         self._wdv3_session = None
         self._rating_session = None
         self._tag_names: List[str] = []
@@ -415,18 +429,24 @@ class AnimeBranch:
         genital_score: float,
         breast_score: float,
     ) -> float:
+        fusion_weights = self._config.sensitivity.get("pipeline_fusion", {}).get("weights", {}) if self._config else {}
+        w_explicit = fusion_weights.get("wdv3_explicit", 0.30)
+        w_r18 = fusion_weights.get("anime_rating_r18", 0.25)
+        w_genital = fusion_weights.get("genital_score", 0.30)
+        w_breast = fusion_weights.get("breast_score", 0.15)
+        
         final_score = (
-            wdv3_explicit * 0.30
-            + anime_rating_r18 * 0.25
-            + genital_score * 0.30
-            + breast_score * 0.15
+            wdv3_explicit * w_explicit
+            + anime_rating_r18 * w_r18
+            + genital_score * w_genital
+            + breast_score * w_breast
         )
         logger.debug(
-            "[AnimeBranch] Score fusion: explicit=%.3f*0.30 + r18=%.3f*0.25 + genital=%.3f*0.30 + breast=%.3f*0.15 => %.3f",
-            wdv3_explicit,
-            anime_rating_r18,
-            genital_score,
-            breast_score,
+            "[AnimeBranch] Score fusion: explicit=%.3f*%.2f + r18=%.3f*%.2f + genital=%.3f*%.2f + breast=%.3f*%.2f => %.3f",
+            wdv3_explicit, w_explicit,
+            anime_rating_r18, w_r18,
+            genital_score, w_genital,
+            breast_score, w_breast,
             final_score,
         )
         return final_score
@@ -477,11 +497,20 @@ class AnimeBranch:
                 breast_score,
             )
 
-            if genital_score >= 0.60:
+            fusion_thresholds = self._config.sensitivity.get("pipeline_fusion", {}).get("thresholds", {}) if self._config else {}
+            
+            def _get_thresh(val):
+                return self._config.get_threshold(val) if self._config else val
+
+            t_explicit = _get_thresh(fusion_thresholds.get("explicit_genital_score", 0.60))
+            t_nsfw = _get_thresh(fusion_thresholds.get("nsfw_breast_score", 0.60))
+            t_sugg = _get_thresh(fusion_thresholds.get("suggestive_final_score", 0.50))
+
+            if genital_score >= t_explicit:
                 verdict = "EXPLICIT"
-            elif breast_score >= 0.60:
+            elif breast_score >= t_nsfw:
                 verdict = "NSFW"
-            elif final_score >= 0.50:
+            elif final_score >= t_sugg:
                 verdict = "SUGGESTIVE"
             else:
                 verdict = "SAFE"

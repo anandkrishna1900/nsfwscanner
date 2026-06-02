@@ -1,0 +1,89 @@
+{
+  "global_threshold": 0,
+  "prefilter": {
+    "threshold": 0.15
+  },
+  "pipeline_fusion": {
+    "weights": {
+      "wdv3_explicit": 0.30,
+      "anime_rating_r18": 0.25,
+      "genital_score": 0.30,
+      "breast_score": 0.15
+    },
+    "thresholds": {
+      "explicit_genital_score": 0.60,
+      "nsfw_breast_score": 0.60,
+      "suggestive_final_score": 0.50
+    }
+  },
+  "real_branch": {
+    "review_offset": 0.10,
+    "low_quality_retry_low": 0.30,
+    "low_quality_retry_high": 0.50,
+    "labels": {
+      "FEMALE_GENITALIA_EXPOSED": 0.40,
+      "MALE_GENITALIA_EXPOSED": 0.40,
+      "ANUS_EXPOSED": 0.45,
+      "MALE_GENITALIA_COVERED": 0.65,
+      "FEMALE_BREAST_EXPOSED": 0.40
+    }
+  },
+  "anime_branch": {
+    "genital_tags": {
+      "penis": 0.50,
+      "vagina": 0.50,
+      "pussy": 0.50,
+      "genitals": 0.55,
+      "testicles": 0.50,
+      "erection": 0.48,
+      "anus": 0.50,
+      "phallus": 0.50,
+      "cum": 0.55,
+      "sex": 0.55,
+      "rape": 0.52,
+      "nude": 0.55,
+      "naked": 0.55
+    },
+    "breast_tags": {
+      "nipples": 0.50,
+      "bare_breasts": 0.50,
+      "breasts_out": 0.52,
+      "areola_slip": 0.50,
+      "nipple_slip": 0.50,
+      "breast_slip": 0.50,
+      "one_breast_out": 0.50,
+      "topless": 0.50,
+      "large_areolae": 0.52,
+      "dark_areolae": 0.52,
+      "light_areolae": 0.52,
+      "puffy_nipples": 0.52,
+      "huge_nipples": 0.52,
+      "dark_nipples": 0.52,
+      "colored_nipples": 0.52,
+      "nipple_tweak": 0.52,
+      "exposed_breasts": 0.50,
+      "breast_out": 0.50,
+      "breast_grab": 0.55
+    },
+    "safe_context_tags": {
+      "bikini": 0.15,
+      "swimsuit": 0.15,
+      "underwear": 0.12,
+      "bra": 0.10,
+      "panties": 0.12,
+      "lingerie": 0.10,
+      "cameltoe": 0.08,
+      "cleavage": 0.08,
+      "sideboob": 0.10,
+      "micro_bikini": 0.12
+    },
+    "suggestive_tags": {
+      "lingerie": 0.62,
+      "underboob": 0.60,
+      "cameltoe": 0.62,
+      "implied_nudity": 0.62,
+      "clothes_lift": 0.65,
+      "no_bra": 0.65
+    }
+  }
+}

@@ -19,9 +19,6 @@ logger = logging.getLogger(__name__)
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-_INPUT_SIZE = 384  # ViT-base typically uses 224 or 384
-
-
 class AdamCoddPrefilter:
     """
     ONNX-based NSFW pre-filter using AdamCodd/vit-base-nsfw-detector.
@@ -35,6 +32,7 @@ class AdamCoddPrefilter:
         self._session = None
         self._input_name: Optional[str] = None
         self._output_name: Optional[str] = None
+        self._input_size: int = 384
         self._load()
 
     def _load(self) -> None:
@@ -78,17 +76,16 @@ class AdamCoddPrefilter:
         # Determine input size from model graph
         input_shape = self._session.get_inputs()[0].shape
         if len(input_shape) == 4 and isinstance(input_shape[2], int) and input_shape[2] > 0:
-            global _INPUT_SIZE
-            _INPUT_SIZE = input_shape[2]
+            self._input_size = input_shape[2]
 
-        logger.info("[Prefilter] Ready (input size: %dx%d)", _INPUT_SIZE, _INPUT_SIZE)
+        logger.info("[Prefilter] Ready (input size: %dx%d)", self._input_size, self._input_size)
 
     def _preprocess(self, image: Image.Image) -> np.ndarray:
         """Resize, normalize, and convert image to float32 NCHW numpy array."""
         from utils.image_utils import prepare_image_for_onnx
         return prepare_image_for_onnx(
             image,
-            target_size=_INPUT_SIZE,
+            target_size=self._input_size,
             normalize_imagenet=True,
             to_chw=True,
         )

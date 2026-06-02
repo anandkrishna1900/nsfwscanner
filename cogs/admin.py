@@ -44,8 +44,21 @@ def _load_config() -> dict:
 
 
 def _save_config(data: dict) -> None:
-    with open(_CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    import tempfile
+    dir_name = os.path.dirname(os.path.abspath(_CONFIG_FILE)) or "."
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=dir_name, suffix=".tmp", delete=False
+        ) as tmp:
+            json.dump(data, tmp, indent=4)
+            tmp_path = tmp.name
+        os.replace(tmp_path, _CONFIG_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def _get_guild(data: dict, guild_id: str) -> dict:

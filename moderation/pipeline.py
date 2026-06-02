@@ -45,6 +45,8 @@ class ScanResult:
 
 
 # ── Module-level singletons (lazy init) ───────────────────────────────────────
+import threading
+_init_lock = threading.Lock()
 _prefilter = None
 _gatekeeper = None
 _real_branch = None
@@ -53,42 +55,55 @@ _initialized = False
 
 
 def _ensure_models_initialized(config: "BotConfig") -> None:
-    """Initialize all model singletons on first call."""
+    """Initialize all model singletons on first call (thread-safe)."""
     global _prefilter, _gatekeeper, _real_branch, _anime_branch, _initialized
+    # Fast path — no lock needed after init
     if _initialized:
         return
+    with _init_lock:
+        # Re-check inside the lock (double-checked locking)
+        if _initialized:
+            return
 
-    from moderation.prefilter import AdamCoddPrefilter
-    from moderation.gatekeeper import ContentTypeRouter
-    from moderation.real_branch import RealBranch
-    from moderation.anime_branch import AnimeBranch
+        from moderation.prefilter import AdamCoddPrefilter
+        from moderation.gatekeeper import ContentTypeRouter
+        from moderation.real_branch import RealBranch
+        from moderation.anime_branch import AnimeBranch
 
-    logger.info("[Pipeline] Initializing models (first-run)…")
+        logger.info("[Pipeline] Initializing models (first-run)…")
 
-    # Pre-filter loads eagerly (it's the only model that stays in memory)
-    _prefilter = AdamCoddPrefilter(cache_dir=config.model_cache_dir)
+        # Pre-filter loads eagerly (it's the only model that stays in memory)
+        _prefilter = AdamCoddPrefilter(cache_dir=config.model_cache_dir)
 
-    # Gatekeeper: load lazily but keep in memory (small model)
-    try:
-        _gatekeeper = ContentTypeRouter(cache_dir=config.model_cache_dir)
-    except Exception as e:
-        logger.error("[Pipeline] Gatekeeper failed to load: %s — will skip routing", e)
-        _gatekeeper = None
+        # Gatekeeper: load lazily but keep in memory (small model)
+        try:
+            _gatekeeper = ContentTypeRouter(cache_dir=config.model_cache_dir)
+        except Exception as e:
+            logger.error("[Pipeline] Gatekeeper failed to load: %s — will skip routing", e)
+            _gatekeeper = None
 
-    # Branches: instantiated now but internally lazy
-    _real_branch = RealBranch()
+        # Branches: instantiated now but internally lazy
+        _real_branch = RealBranch(config=config)
 
-    try:
-        _anime_branch = AnimeBranch(cache_dir=config.model_cache_dir)
-    except Exception as e:
-        logger.error("[Pipeline] AnimeBranch failed to load: %s — anime scanning disabled", e)
-        _anime_branch = None
+        try:
+            _anime_branch = AnimeBranch(cache_dir=config.model_cache_dir, config=config)
+        except Exception as e:
+            logger.error("[Pipeline] AnimeBranch failed to load: %s — anime scanning disabled", e)
+            _anime_branch = None
 
-    _initialized = True
-    logger.info("[Pipeline] All models initialized")
+        _initialized = True
+        logger.info("[Pipeline] All models initialized")
 
 
 # ── Attachment download ────────────────────────────────────────────────────────
+_http_session: Optional[aiohttp.ClientSession] = None
+
+def _get_session() -> aiohttp.ClientSession:
+    """Return a shared aiohttp session, creating it on first use."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
 
 async def _download_attachment(
     url: str,
@@ -103,20 +118,20 @@ async def _download_attachment(
     downloaded = 0
 
     timeout = aiohttp.ClientTimeout(total=60, connect=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise IOError(f"HTTP {resp.status} when downloading {url}")
+    session = _get_session()
+    async with session.get(url, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise IOError(f"HTTP {resp.status} when downloading {url}")
 
-            with open(dest_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(65536):
-                    downloaded += len(chunk)
-                    if downloaded > max_bytes:
-                        raise ValueError(
-                            f"Attachment exceeds {max_size_mb} MB size limit "
-                            f"({downloaded / 1048576:.1f} MB so far)"
-                        )
-                    f.write(chunk)
+        with open(dest_path, "wb") as f:
+            async for chunk in resp.content.iter_chunked(65536):
+                downloaded += len(chunk)
+                if downloaded > max_bytes:
+                    raise ValueError(
+                        f"Attachment exceeds {max_size_mb} MB size limit "
+                        f"({downloaded / 1048576:.1f} MB so far)"
+                    )
+                f.write(chunk)
 
     logger.debug("[Pipeline] Downloaded %d bytes → %s", downloaded, dest_path)
 
@@ -288,11 +303,12 @@ async def scan_attachment(
             w, h = frame.size
 
             # Stage 0: Pre-filter
+            pf_thresh = config.get_threshold(config.sensitivity.get("prefilter", {}).get("threshold", 0.15))
             prefilter_score = await asyncio.to_thread(_prefilter.score, frame)
-            worth_checking = prefilter_score >= 0.15 or bypass_prefilter
+            worth_checking = prefilter_score >= pf_thresh or bypass_prefilter
 
             verdict_text = "Passed to Gatekeeper Router"
-            if not (prefilter_score >= 0.15):
+            if not (prefilter_score >= pf_thresh):
                 if bypass_prefilter:
                     verdict_text = "Passed to Gatekeeper Router (Forced via Test Mode)"
                 else:
@@ -303,7 +319,7 @@ async def scan_attachment(
                 f"  Model: AdamCodd/vit-base-nsfw-detector (ONNX CPU)\n"
                 f"  Resolution: {w}x{h}\n"
                 f"  NSFW Score: {prefilter_score:.4f}\n"
-                f"  Threshold: 0.15\n"
+                f"  Threshold: {pf_thresh}\n"
                 f"  Verdict: {verdict_text}"
             )
 
@@ -368,22 +384,33 @@ async def scan_attachment(
                 sugg_sc = getattr(branch_result, 'suggestive_score', 0.0)
                 fin_sc = getattr(branch_result, 'final_score', 0.0)
 
+                fusion_weights = config.sensitivity.get("pipeline_fusion", {}).get("weights", {})
+                w_explicit = fusion_weights.get("wdv3_explicit", 0.30)
+                w_r18 = fusion_weights.get("anime_rating_r18", 0.25)
+                w_genital = fusion_weights.get("genital_score", 0.30)
+                w_breast = fusion_weights.get("breast_score", 0.15)
+                
+                fusion_thresholds = config.sensitivity.get("pipeline_fusion", {}).get("thresholds", {})
+                t_explicit = config.get_threshold(fusion_thresholds.get("explicit_genital_score", 0.60))
+                t_nsfw = config.get_threshold(fusion_thresholds.get("nsfw_breast_score", 0.60))
+                t_sugg = config.get_threshold(fusion_thresholds.get("suggestive_final_score", 0.50))
+
                 steps.append(
                     f"Stage 2B: Anime/Hentai Branch (Score Fusion)\n"
                     f"  Models:\n"
                     f"    - SmilingWolf/wd-vit-large-tagger-v3 (ONNX CPU)\n"
                     f"    - deepghs/anime_rating (ONNX CPU)\n"
                     f"  Scores & Fusion Math:\n"
-                    f"    - wdv3_explicit: {wdv3_exp:.4f} (weight: 0.30)\n"
-                    f"    - anime_rating_r18: {ar_r18:.4f} (weight: 0.25)\n"
-                    f"    - genital_score: {gen_sc:.4f} (weight: 0.30)\n"
-                    f"    - breast_score: {breast_sc:.4f} (weight: 0.15)\n"
+                    f"    - wdv3_explicit: {wdv3_exp:.4f} (weight: {w_explicit})\n"
+                    f"    - anime_rating_r18: {ar_r18:.4f} (weight: {w_r18})\n"
+                    f"    - genital_score: {gen_sc:.4f} (weight: {w_genital})\n"
+                    f"    - breast_score: {breast_sc:.4f} (weight: {w_breast})\n"
                     f"    - suggestive_score: {sugg_sc:.4f}\n"
-                    f"    - Formula: ({wdv3_exp:.4f} * 0.30) + ({ar_r18:.4f} * 0.25) + ({gen_sc:.4f} * 0.30) + ({breast_sc:.4f} * 0.15) = {fin_sc:.4f}\n"
+                    f"    - Formula: ({wdv3_exp:.4f} * {w_explicit}) + ({ar_r18:.4f} * {w_r18}) + ({gen_sc:.4f} * {w_genital}) + ({breast_sc:.4f} * {w_breast}) = {fin_sc:.4f}\n"
                     f"  Decision Tiers:\n"
-                    f"    - EXPLICIT: genital_score >= 0.60\n"
-                    f"    - NSFW: breast_score >= 0.60\n"
-                    f"    - SUGGESTIVE: fused score >= 0.50\n"
+                    f"    - EXPLICIT: genital_score >= {t_explicit}\n"
+                    f"    - NSFW: breast_score >= {t_nsfw}\n"
+                    f"    - SUGGESTIVE: fused score >= {t_sugg}\n"
                     f"    - SAFE: otherwise\n"
                     f"  Detected Explicit Tags: {tags_str}\n"
                     f"  Tagger Rating: {getattr(branch_result, 'rating', 'unknown')}\n"
@@ -418,6 +445,12 @@ async def scan_attachment(
                 anime_sugg_sc = getattr(anime_res, 'suggestive_score', 0.0)
                 anime_fin_sc = getattr(anime_res, 'final_score', 0.0)
 
+                fusion_weights = config.sensitivity.get("pipeline_fusion", {}).get("weights", {})
+                w_explicit = fusion_weights.get("wdv3_explicit", 0.30)
+                w_r18 = fusion_weights.get("anime_rating_r18", 0.25)
+                w_genital = fusion_weights.get("genital_score", 0.30)
+                w_breast = fusion_weights.get("breast_score", 0.15)
+
                 steps.append(
                     f"Stage 2: Uncertain (Both Branches Evaluated)\n"
                     f"  Real/Photo Branch:\n"
@@ -427,12 +460,12 @@ async def scan_attachment(
                     f"  Anime/Illustration Branch:\n"
                     f"    Models: SmilingWolf/wd-vit-large-tagger-v3 & deepghs/anime_rating (ONNX CPU)\n"
                     f"    Scores & Fusion Math:\n"
-                    f"      - wdv3_explicit: {anime_wdv3_exp:.4f} (weight: 0.30)\n"
-                    f"      - anime_rating_r18: {anime_ar_r18:.4f} (weight: 0.25)\n"
-                    f"      - genital_score: {anime_gen_sc:.4f} (weight: 0.30)\n"
-                    f"      - breast_score: {anime_breast_sc:.4f} (weight: 0.15)\n"
+                    f"      - wdv3_explicit: {anime_wdv3_exp:.4f} (weight: {w_explicit})\n"
+                    f"      - anime_rating_r18: {anime_ar_r18:.4f} (weight: {w_r18})\n"
+                    f"      - genital_score: {anime_gen_sc:.4f} (weight: {w_genital})\n"
+                    f"      - breast_score: {anime_breast_sc:.4f} (weight: {w_breast})\n"
                     f"      - suggestive_score: {anime_sugg_sc:.4f}\n"
-                    f"      - Formula: ({anime_wdv3_exp:.4f} * 0.30) + ({anime_ar_r18:.4f} * 0.25) + ({anime_gen_sc:.4f} * 0.30) + ({anime_breast_sc:.4f} * 0.15) = {anime_fin_sc:.4f}\n"
+                    f"      - Formula: ({anime_wdv3_exp:.4f} * {w_explicit}) + ({anime_ar_r18:.4f} * {w_r18}) + ({anime_gen_sc:.4f} * {w_genital}) + ({anime_breast_sc:.4f} * {w_breast}) = {anime_fin_sc:.4f}\n"
                     f"    Tagger Rating: {getattr(anime_res, 'rating', 'unknown')}\n"
                     f"    Detected Explicit Tags: {anime_tags_str}\n"
                     f"    Verdict: {anime_res.verdict}\n"

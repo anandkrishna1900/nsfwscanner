@@ -18,7 +18,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-MODERATION_LABELS: dict[str, float] = {
+# Note: These are fallback defaults. Actual values are loaded from sensitivity.json
+_DEFAULT_MODERATION_LABELS: dict[str, float] = {
     "FEMALE_GENITALIA_EXPOSED": 0.40,
     "MALE_GENITALIA_EXPOSED": 0.40,
     "ANUS_EXPOSED": 0.45,
@@ -26,9 +27,9 @@ MODERATION_LABELS: dict[str, float] = {
     "FEMALE_BREAST_EXPOSED": 0.40,
 }
 
-REVIEW_OFFSET: float = 0.10
-LOW_QUALITY_RETRY_LOW: float = 0.30
-LOW_QUALITY_RETRY_HIGH: float = 0.50
+_DEFAULT_REVIEW_OFFSET: float = 0.10
+_DEFAULT_LOW_QUALITY_RETRY_LOW: float = 0.30
+_DEFAULT_LOW_QUALITY_RETRY_HIGH: float = 0.50
 
 
 @dataclass
@@ -144,8 +145,19 @@ class RealBranch:
     Callers wrap scan() in asyncio.to_thread() to keep Discord's event loop clear.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config=None) -> None:
         self._detector = None
+        
+        cfg = config.sensitivity.get("real_branch", {}) if config else {}
+        labels = cfg.get("labels", _DEFAULT_MODERATION_LABELS).copy()
+        if config:
+            for k in labels:
+                labels[k] = config.get_threshold(labels[k])
+        self.MODERATION_LABELS = labels
+
+        self.REVIEW_OFFSET = cfg.get("review_offset", _DEFAULT_REVIEW_OFFSET)
+        self.LOW_QUALITY_RETRY_LOW = cfg.get("low_quality_retry_low", _DEFAULT_LOW_QUALITY_RETRY_LOW)
+        self.LOW_QUALITY_RETRY_HIGH = cfg.get("low_quality_retry_high", _DEFAULT_LOW_QUALITY_RETRY_HIGH)
 
     def _ensure_detector(self) -> None:
         if self._detector is None:
@@ -176,7 +188,7 @@ class RealBranch:
         return [
             detection
             for detection in raw_detections
-            if detection.get("class", "") in MODERATION_LABELS
+            if detection.get("class", "") in self.MODERATION_LABELS
         ]
 
     def _max_relevant_score(self, detections: List[dict]) -> float:
@@ -186,7 +198,7 @@ class RealBranch:
 
     def _is_near_threshold(self, detections: List[dict]) -> bool:
         return any(
-            LOW_QUALITY_RETRY_LOW <= float(detection.get("score", 0.0)) <= LOW_QUALITY_RETRY_HIGH
+            self.LOW_QUALITY_RETRY_LOW <= float(detection.get("score", 0.0)) <= self.LOW_QUALITY_RETRY_HIGH
             for detection in detections
         )
 
@@ -201,8 +213,8 @@ class RealBranch:
             label = detection["class"]
             score = float(detection.get("score", 0.0))
             box = detection.get("box")
-            threshold = MODERATION_LABELS[label]
-            review_low = threshold - REVIEW_OFFSET
+            threshold = self.MODERATION_LABELS[label]
+            review_low = threshold - self.REVIEW_OFFSET
 
             logger.debug(
                 "[RealBranch] %s score=%.3f threshold=%.2f review_low=%.2f variant=%s",
@@ -270,8 +282,8 @@ class RealBranch:
             logger.debug(
                 "[RealBranch] Retry triggered=%s (near-threshold window %.2f-%.2f)",
                 retry_triggered,
-                LOW_QUALITY_RETRY_LOW,
-                LOW_QUALITY_RETRY_HIGH,
+                self.LOW_QUALITY_RETRY_LOW,
+                self.LOW_QUALITY_RETRY_HIGH,
             )
 
             if retry_triggered:

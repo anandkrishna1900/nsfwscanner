@@ -7,9 +7,10 @@ Raises ValueError at startup if DISCORD_TOKEN is missing.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from dotenv import load_dotenv
 
@@ -49,6 +50,16 @@ class BotConfig:
     # ── Database ──────────────────────────────────────────────────────────────
     sqlite_db_path: str                    # path to the SQLite .db file
 
+    # ── Sensitivity ───────────────────────────────────────────────────────────
+    sensitivity: Dict[str, Any] = field(default_factory=dict)
+
+    def get_threshold(self, base_value: float) -> float:
+        """Override base_value with global_threshold if it is > 0."""
+        global_t = self.sensitivity.get("global_threshold", 0)
+        if global_t > 0:
+            return float(global_t)
+        return float(base_value)
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         """Load and validate config from environment variables."""
@@ -73,6 +84,14 @@ class BotConfig:
         debug_log_channel_raw = os.getenv("DEBUG_LOG_CHANNEL_ID", "").strip()
         debug_log_channel_id = int(debug_log_channel_raw) if debug_log_channel_raw.isdigit() else None
 
+        # Load sensitivity config
+        sensitivity_config = {}
+        try:
+            with open("sensitivity.json", "r") as f:
+                sensitivity_config = json.load(f)
+        except Exception as e:
+            pass # Fallback to defaults if missing or invalid
+
         return cls(
             discord_token=token.strip(),
             prefix=os.getenv("PREFIX", ";"),
@@ -88,6 +107,7 @@ class BotConfig:
             max_video_duration_secs=int(os.getenv("MAX_VIDEO_DURATION_SECS", "300")),
             review_threshold_offset=float(os.getenv("REVIEW_THRESHOLD_OFFSET", "0.15")),
             sqlite_db_path=os.getenv("SQLITE_DB_PATH", "./bot.db"),
+            sensitivity=sensitivity_config,
         )
 
     def is_monitored(self, channel_id: int) -> bool:

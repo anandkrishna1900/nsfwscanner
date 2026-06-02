@@ -195,8 +195,21 @@ class AutoMod(commands.Cog):
             self.config = {}
 
     def save_config(self) -> None:
-        with open(self.config_file, "w") as f:
-            json.dump(self.config, f, indent=4)
+        import os, tempfile
+        dir_name = os.path.dirname(os.path.abspath(self.config_file)) or "."
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", dir=dir_name, suffix=".tmp", delete=False
+            ) as tmp:
+                json.dump(self.config, tmp, indent=4)
+                tmp_path = tmp.name
+            os.replace(tmp_path, self.config_file)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
 
     def get_server_config(self, guild_id: int) -> dict:
         gid = str(guild_id)
@@ -612,7 +625,7 @@ class AutoMod(commands.Cog):
             feedback_view.add_item(remove_btn)
 
         try:
-            log_msg = await log_channel.send(embed=embed, view=feedback_view)
+            await log_channel.send(embed=embed, view=feedback_view)
         except discord.HTTPException as e:
             logger.error("Failed to send rich NSFW log embed; sending compact fallback: %s", e)
             fallback = discord.Embed(
@@ -628,7 +641,7 @@ class AutoMod(commands.Cog):
                     f"**Model:** `{scan_result.model}`"
                 ),
             )
-            log_msg = await log_channel.send(embed=fallback, view=feedback_view)
+            await log_channel.send(embed=fallback, view=feedback_view)
 
         # Send image preview as spoiler
         if file_info:
@@ -934,9 +947,8 @@ class AutoMod(commands.Cog):
                     except Exception:
                         pass
                     return
-
-            async with self._user_rate_lock:
-                self._user_scan_counts[uid] = self._user_scan_counts.get(uid, 0) + 1
+                # Increment inside the same lock — no window for a race
+                self._user_scan_counts[uid] = active + 1
 
             try:
                 # Per-guild lock to prevent concurrent GPU inference
