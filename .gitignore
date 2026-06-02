@@ -9,6 +9,9 @@ venv/
 env/
 .venv/
 
+# Environment
+.env
+
 # OS / IDE
 .DS_Store
 Thumbs.db
