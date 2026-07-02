@@ -1,11 +1,4 @@
-"""
-bot/cogs/admin.py — Admin slash command group for NSFW scanner control.
 
-All commands require Manage Messages permission.
-Channel monitoring config is persisted to automod_config.json (same file
-that automod.py uses) under each guild's "channels" list — no separate
-nsfw_channels.json.
-"""
 
 from __future__ import annotations
 
@@ -98,8 +91,6 @@ class NSFWAdminCog(commands.Cog):
         description="NSFW scanner admin commands (requires Manage Messages)",
     )
 
-    # ── /nsfw enable ──────────────────────────────────────────────────────────
-
     @nsfw_group.command(name="enable", description="Add a channel to NSFW monitoring")
     @_has_manage_messages()
     async def nsfw_enable(
@@ -130,8 +121,6 @@ class NSFWAdminCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
         logger.info("Guild %s: added #%s to NSFW monitoring", guild_id, channel.name)
 
-    # ── /nsfw disable ─────────────────────────────────────────────────────────
-
     @nsfw_group.command(name="disable", description="Remove a channel from NSFW monitoring")
     @_has_manage_messages()
     async def nsfw_disable(
@@ -161,8 +150,6 @@ class NSFWAdminCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
         logger.info("Guild %s: removed #%s from NSFW monitoring", guild_id, channel.name)
 
-    # ── /nsfw status ──────────────────────────────────────────────────────────
-
     @nsfw_group.command(name="status", description="Show NSFW scanner status and monitored channels")
     @_has_manage_messages()
     async def nsfw_status(self, interaction: discord.Interaction) -> None:
@@ -178,7 +165,6 @@ class NSFWAdminCog(commands.Cog):
             guild_cfg = _get_guild(data, guild_id)
             guild_channels: list[int] = guild_cfg.get("channels", [])
 
-            # Resolve channel mentions
             if guild_channels:
                 mentions = []
                 for cid in guild_channels:
@@ -188,10 +174,8 @@ class NSFWAdminCog(commands.Cog):
             else:
                 channels_text = "All channels (no specific channels configured)"
 
-            # Scanner enabled/disabled
             enabled_text = "🟢 Enabled" if guild_cfg.get("enabled", True) else "🔴 Disabled"
 
-            # Loaded models info
             loaded = pl._initialized
             model_lines = []
             if loaded:
@@ -206,7 +190,6 @@ class NSFWAdminCog(commands.Cog):
             else:
                 model_lines = ["⏳ Models not yet initialized (loads on first scan)"]
 
-            # VRAM info
             vram_text = "N/A"
             try:
                 import torch
@@ -240,8 +223,6 @@ class NSFWAdminCog(commands.Cog):
         except Exception as e:
             logger.error("nsfw status error: %s", e, exc_info=True)
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-
-    # ── /nsfw test ────────────────────────────────────────────────────────────
 
     @nsfw_group.command(name="test", description="Test the NSFW scanner on an attached image (no action taken)")
     @_has_manage_messages()
@@ -308,9 +289,6 @@ class NSFWAdminCog(commands.Cog):
             logger.error("nsfw test error: %s", e, exc_info=True)
             await interaction.followup.send(f"❌ Scan failed: {e}", ephemeral=True)
 
-
-    # ── /nsfw feedback-stats ──────────────────────────────────────────────────
-
     @nsfw_group.command(
         name="feedback-stats",
         description="Show moderator feedback statistics and model accuracy estimates",
@@ -343,7 +321,6 @@ class NSFWAdminCog(commands.Cog):
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 return
 
-            # Color based on accuracy
             accuracy = stats["accuracy"]
             color = (
                 0x22C55E if accuracy >= 80
@@ -361,7 +338,6 @@ class NSFWAdminCog(commands.Cog):
                 timestamp=discord.utils.utcnow(),
             )
 
-            # Summary stats
             embed.add_field(
                 name="📈 Feedback Summary",
                 value=(
@@ -373,7 +349,6 @@ class NSFWAdminCog(commands.Cog):
                 inline=True,
             )
 
-            # Rate stats
             embed.add_field(
                 name="📉 Error Rates",
                 value=(
@@ -384,7 +359,6 @@ class NSFWAdminCog(commands.Cog):
                 inline=True,
             )
 
-            # Accuracy bar (emoji visualization)
             filled = int(accuracy / 10)
             bar = "🟩" * filled + "⬜" * (10 - filled)
             embed.add_field(
@@ -393,7 +367,6 @@ class NSFWAdminCog(commands.Cog):
                 inline=False,
             )
 
-            # Top failed tags
             top_tags = stats.get("top_failed_tags", [])
             if top_tags:
                 tag_lines = [f"`{tag}` — **{count}** failures" for tag, count in top_tags[:8]]
@@ -412,9 +385,6 @@ class NSFWAdminCog(commands.Cog):
         except Exception as e:
             logger.error("nsfw feedback-stats error: %s", e, exc_info=True)
             await interaction.followup.send(f"❌ Error fetching stats: {e}", ephemeral=True)
-
-
-    # ── /nsfw stats ───────────────────────────────────────────────────────────
 
     @nsfw_group.command(
         name="stats",
@@ -441,7 +411,6 @@ class NSFWAdminCog(commands.Cog):
                 timestamp=discord.utils.utcnow(),
             )
 
-            # ── Scan volume ───────────────────────────────────────────────
             if total == 0:
                 embed.description = (
                     "No scans have been logged yet for this server.\n"
@@ -464,7 +433,6 @@ class NSFWAdminCog(commands.Cog):
                 inline=True,
             )
 
-            # ── Verdict breakdown ─────────────────────────────────────────
             bd = scan_stats["verdict_breakdown"]
             bd_lines = "\n".join(
                 f"`{v}`: **{c:,}**" for v, c in sorted(bd.items(), key=lambda x: -x[1])
@@ -522,7 +490,6 @@ class NSFWAdminCog(commands.Cog):
             logger.error("nsfw stats error: %s", e, exc_info=True)
             await interaction.followup.send(f"❌ Error fetching stats: {e}", ephemeral=True)
 
-    # ── /nsfw export ──────────────────────────────────────────────────────────
 
     @nsfw_group.command(
         name="export",

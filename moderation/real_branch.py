@@ -1,11 +1,3 @@
-"""
-moderation/real_branch.py - Stage 2A: Real/photo content branch using NudeNet.
-
-NudeNet uses ONNX internally and runs on CPU. This branch improves detection on
-low-quality real images by running the same local detector over a few lightweight
-OpenCV-enhanced variants, then selecting the highest-confidence moderation label.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -18,7 +10,7 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# Note: These are fallback defaults. Actual values are loaded from sensitivity.json
+# Fallback defaults — actual values are loaded from sensitivity.json
 _DEFAULT_MODERATION_LABELS: dict[str, float] = {
     "FEMALE_GENITALIA_EXPOSED": 0.40,
     "MALE_GENITALIA_EXPOSED": 0.40,
@@ -147,7 +139,7 @@ class RealBranch:
 
     def __init__(self, config=None) -> None:
         self._detector = None
-        
+
         cfg = config.sensitivity.get("real_branch", {}) if config else {}
         labels = cfg.get("labels", _DEFAULT_MODERATION_LABELS).copy()
         if config:
@@ -162,7 +154,6 @@ class RealBranch:
     def _ensure_detector(self) -> None:
         if self._detector is None:
             from nudenet import NudeDetector
-
             self._detector = NudeDetector()
             logger.info("[RealBranch] NudeDetector loaded")
 

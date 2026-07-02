@@ -1,13 +1,3 @@
-"""
-moderation/anime_branch.py - Stage 2B: Anime/hentai content branch.
-
-Primary: SmilingWolf/wd-vit-large-tagger-v3 (WDv3) ONNX tagger.
-Secondary: deepghs/anime_rating ONNX classifier.
-
-Anime moderation tiers: SAFE, SUGGESTIVE, NSFW, EXPLICIT.
-Ratings are broad classifiers; anatomical evidence tags drive escalation.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -20,7 +10,7 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# Fallbacks if config is missing
+# Fallbacks used when sensitivity.json does not define these tag groups
 _DEFAULT_GENITAL_TAGS: Dict[str, float] = {
     "penis": 0.50,
     "vagina": 0.50,
@@ -108,19 +98,18 @@ class AnimeBranch:
     def __init__(self, cache_dir: str, config=None) -> None:
         self._cache_dir = cache_dir
         self._config = config
-        
-        # Load from config or use defaults
+
         cfg = config.sensitivity.get("anime_branch", {}) if config else {}
-        
+
         gen_tags = cfg.get("genital_tags", _DEFAULT_GENITAL_TAGS).copy()
         breast_tags = cfg.get("breast_tags", _DEFAULT_BREAST_TAGS).copy()
         sugg_tags = cfg.get("suggestive_tags", _DEFAULT_SUGGESTIVE_TAGS).copy()
-        
+
         if config:
             for k in gen_tags: gen_tags[k] = config.get_threshold(gen_tags[k])
             for k in breast_tags: breast_tags[k] = config.get_threshold(breast_tags[k])
             for k in sugg_tags: sugg_tags[k] = config.get_threshold(sugg_tags[k])
-            
+
         self.GENITAL_TAGS = gen_tags
         self.BREAST_TAGS = breast_tags
         self.SUGGESTIVE_TAGS = sugg_tags
@@ -434,7 +423,7 @@ class AnimeBranch:
         w_r18 = fusion_weights.get("anime_rating_r18", 0.25)
         w_genital = fusion_weights.get("genital_score", 0.30)
         w_breast = fusion_weights.get("breast_score", 0.15)
-        
+
         final_score = (
             wdv3_explicit * w_explicit
             + anime_rating_r18 * w_r18
@@ -498,7 +487,7 @@ class AnimeBranch:
             )
 
             fusion_thresholds = self._config.sensitivity.get("pipeline_fusion", {}).get("thresholds", {}) if self._config else {}
-            
+
             def _get_thresh(val):
                 return self._config.get_threshold(val) if self._config else val
 

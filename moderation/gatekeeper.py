@@ -1,10 +1,3 @@
-"""
-moderation/gatekeeper.py — Stage 1: Content-type router (anime vs real/photo).
-
-Uses deepghs/anime_real_cls ONNX model on CPU.
-Returns "real", "anime", or "uncertain" based on confidence threshold.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -36,7 +29,6 @@ class ContentTypeRouter:
         self._output_name: Optional[str] = None
         self._input_size: int = _DEFAULT_INPUT_SIZE
         # Labels: index 0 = anime/illustration, index 1 = real/photo
-        # (will be confirmed from model metadata if available)
         self._labels: list[str] = ["anime", "real"]
 
     def _load(self) -> None:
@@ -46,7 +38,6 @@ class ContentTypeRouter:
 
         logger.info("[Gatekeeper] Loading deepghs/anime_real_cls ONNX…")
 
-        # Discover the actual ONNX file(s) in the repo rather than guessing names
         try:
             repo_files = list(list_repo_files("deepghs/anime_real_cls"))
         except Exception as e:
@@ -92,7 +83,6 @@ class ContentTypeRouter:
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 
-        # Infer input size from model graph
         input_shape = self._session.get_inputs()[0].shape
         if len(input_shape) == 4 and isinstance(input_shape[2], int) and input_shape[2] > 0:
             self._input_size = input_shape[2]
@@ -134,9 +124,8 @@ class ContentTypeRouter:
             logger.warning("[Gatekeeper] Inference error: %s", e)
             return ("uncertain", 0.0)
 
-        raw = outputs[0][0]  # shape: (N,) where N = number of classes
+        raw = outputs[0][0]
 
-        # Apply softmax if needed
         def softmax(x: np.ndarray) -> np.ndarray:
             e = np.exp(x - np.max(x))
             return e / e.sum()
@@ -149,7 +138,6 @@ class ContentTypeRouter:
         if confidence < _CONFIDENCE_THRESHOLD:
             label = "uncertain"
         else:
-            # Map index to label; fall back to index comparison
             if best_idx < len(self._labels):
                 label = self._labels[best_idx]
             else:

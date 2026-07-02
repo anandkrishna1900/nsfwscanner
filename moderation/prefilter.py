@@ -1,10 +1,3 @@
-"""
-moderation/prefilter.py — Stage 0: AdamCodd ViT NSFW pre-filter (always loaded).
-
-Fast binary safe/nsfw ONNX model that runs on CPU.
-If score < 0.15, skip all further processing (only obviously safe content).
-"""
-
 from __future__ import annotations
 
 import logging
@@ -15,7 +8,6 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ImageNet normalization constants
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -73,7 +65,6 @@ class AdamCoddPrefilter:
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
 
-        # Determine input size from model graph
         input_shape = self._session.get_inputs()[0].shape
         if len(input_shape) == 4 and isinstance(input_shape[2], int) and input_shape[2] > 0:
             self._input_size = input_shape[2]
@@ -112,14 +103,12 @@ class AdamCoddPrefilter:
             logger.warning("[Prefilter] Inference error: %s", e)
             return 1.0  # fail open
 
-        raw = outputs[0][0]  # shape: (2,) or (1,)
+        raw = outputs[0][0]
 
         if len(raw) == 2:
-            # Logits or probabilities for [safe, nsfw]
-            # Apply softmax if they don't sum to ~1
             total = float(raw[0]) + float(raw[1])
             if abs(total - 1.0) > 0.1:
-                # They're logits — apply softmax
+                # Logits — apply softmax
                 import math
                 e0 = math.exp(float(raw[0]))
                 e1 = math.exp(float(raw[1]))

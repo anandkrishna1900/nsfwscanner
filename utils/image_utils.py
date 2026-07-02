@@ -1,8 +1,4 @@
-"""
-utils/image_utils.py — Discord attachment download utilities.
 
-Provides async streaming download with size limit enforcement.
-"""
 
 from __future__ import annotations
 
@@ -51,7 +47,7 @@ async def download_attachment(
                 )
 
             with open(dest_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(65536):  # 64 KB chunks
+                async for chunk in resp.content.iter_chunked(65536):
                     downloaded += len(chunk)
                     if downloaded > max_bytes:
                         raise ValueError(
@@ -111,7 +107,6 @@ def prepare_image_for_onnx(
     - Optionally transposes from HWC to CHW format.
     - Returns a 4D tensor with batch dimension (shape [1, C, H, W] or [1, H, W, C]).
     """
-    # 1. Handle transparency
     if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
         canvas = Image.new("RGBA", image.size, (255, 255, 255))
         canvas.alpha_composite(image.convert("RGBA"))
@@ -119,7 +114,6 @@ def prepare_image_for_onnx(
     else:
         img = image.convert("RGB")
 
-    # 2. Pad to square preserving aspect ratio
     w, h = img.size
     max_dim = max(w, h)
     pad_left = (max_dim - w) // 2
@@ -128,28 +122,22 @@ def prepare_image_for_onnx(
     padded_img = Image.new("RGB", (max_dim, max_dim), (255, 255, 255))
     padded_img.paste(img, (pad_left, pad_top))
 
-    # 3. Resize to target_size
     if max_dim != target_size:
         padded_img = padded_img.resize((target_size, target_size), Image.BICUBIC)
 
-    # 4. Convert to float32 numpy array [0.0, 1.0]
     arr = np.array(padded_img, dtype=np.float32) / 255.0
 
-    # 5. Swap RGB to BGR if requested
     if to_bgr:
         arr = arr[:, :, ::-1]
 
-    # 6. Apply ImageNet normalization if requested
     if normalize_imagenet:
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         arr = (arr - mean) / std
 
-    # 7. Transpose to CHW if requested
     if to_chw:
         arr = arr.transpose(2, 0, 1)
 
-    # 8. Add batch dimension
     return np.expand_dims(arr, axis=0).copy()
 
 
@@ -173,7 +161,6 @@ def generate_placeholder_image() -> bytes:
     text_line1 = "⚠️ PREVIEW UNAVAILABLE"
     text_line2 = "[ FLAGGED NSFW ]"
     
-    # Attempt to load Arial or clean font
     try:
         font_title = ImageFont.truetype("arial.ttf", 14)
         font_sub = ImageFont.truetype("arial.ttf", 11)
@@ -196,9 +183,7 @@ def generate_placeholder_image() -> bytes:
     x2 = (width - w2) // 2
     y2 = y1 + h1 + 12
     
-    # White text for warning header
     draw.text((x1, y1), text_line1, fill=(255, 255, 255), font=font_title)
-    # Vibrant red text for the subtext
     draw.text((x2, y2), text_line2, fill=(239, 68, 68), font=font_sub)
     
     buf = io.BytesIO()

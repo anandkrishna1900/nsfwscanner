@@ -1,12 +1,4 @@
-"""
-bot/cogs/automod.py — NSFW Moderation cog.
 
-Listens for messages in monitored channels, runs the local AI pipeline,
-and takes action based on SAFE / SUGGESTIVE / REVIEW / NSFW / BLOCK / EXPLICIT verdicts.
-
-Per-guild config (punishment, channels, whitelist, log_channel) is stored
-in automod_config.json.
-"""
 
 from __future__ import annotations
 
@@ -164,13 +156,11 @@ class AutoMod(commands.Cog):
         self.bot = bot
         self.config_file = "automod_config.json"
         self._guild_locks: dict[int, asyncio.Lock] = {}
-        # Rate limiting: track active scans per user to prevent GPU/CPU flooding
         self._user_scan_counts: dict[int, int] = {}
         self._user_rate_lock: asyncio.Lock = asyncio.Lock()
         self.load_config()
         logger.info("🤖 AutoMod initialized with local AI pipeline")
 
-    # ── Config helpers ────────────────────────────────────────────────────────
 
     def load_config(self) -> None:
         try:
@@ -251,7 +241,6 @@ class AutoMod(commands.Cog):
                 if self._user_scan_counts[user_id] <= 0:
                     self._user_scan_counts.pop(user_id, None)
 
-    # ── Image URL extraction ──────────────────────────────────────────────────
 
     @staticmethod
     def _is_discord_cdn_url(url: str) -> bool:
@@ -281,7 +270,6 @@ class AutoMod(commands.Cog):
         """
         results: list[tuple[str, str, int]] = []
 
-        # ── 1. Direct attachments — discord.py always gives fresh signed URLs ──
         for att in message.attachments:
             ct = att.content_type or ""
             if any(ct.startswith(prefix) for prefix in ("image/", "video/")):
@@ -291,7 +279,6 @@ class AutoMod(commands.Cog):
             ):
                 results.append((att.url, att.filename, att.size))
 
-        # ── 2. Embeds — Discord auto-generates these for pasted links ──────────
         # proxy_url is Discord's own cached copy; it may or may not carry auth.
         # Build a lookup so step 3 can upgrade bare text links to proxied URLs.
         embed_proxy_lookup: dict[str, str] = {}
@@ -300,19 +287,18 @@ class AutoMod(commands.Cog):
                 if not img_obj or not img_obj.url:
                     continue
                 clean_key = img_obj.url.split("?")[0]
-                # Pick the best URL candidate: proxy first, then original
+                # Only use Discord CDN candidates that have auth params
                 for candidate in (img_obj.proxy_url, img_obj.url):
                     if not candidate:
                         continue
-                    # Only use Discord CDN candidates that have auth params
                     if self._is_discord_cdn_url(candidate) and not self._discord_url_has_auth(candidate):
                         continue
                     embed_proxy_lookup[clean_key] = candidate
                     fname = "embed_gif" if (embed.type == "gifv" or "tenor.com" in candidate or "giphy.com" in candidate) else "embed_image"
                     results.append((candidate, fname, 0))
-                    break  # stop at first usable candidate
+                    break
 
-        # ── 3. URLs found in message text ──────────────────────────────────────
+        # URLs found in message text
         if message.content:
             patterns = [
                 r"https?://[^\s]+?\.(?:jpg|jpeg|png|gif|webp|mp4|webm|mov)(?:\?[^\s]*)?",
@@ -335,12 +321,10 @@ class AutoMod(commands.Cog):
                     except Exception:
                         pass
 
-                    # Prefer embed proxy URL if Discord already resolved it
                     if clean in embed_proxy_lookup:
                         resolved = embed_proxy_lookup[clean]
                     elif self._is_discord_cdn_url(clean):
-                        # Bare Discord CDN link — only usable if auth params are present.
-                        # Without ex=, is=, hm= the CDN returns HTTP 404.
+                        # Bare Discord CDN — only usable if auth params are present (without them CDN returns 404)
                         if self._discord_url_has_auth(match):
                             resolved = match
                         else:
@@ -350,7 +334,6 @@ class AutoMod(commands.Cog):
                             seen_clean.add(clean)
                             continue
                     else:
-                        # External URL (imgur, etc.) — keep full match with any params
                         resolved = match
 
                     results.append((resolved, fname, 0))
@@ -359,7 +342,6 @@ class AutoMod(commands.Cog):
         return results
 
 
-    # ── Action helpers ────────────────────────────────────────────────────────
 
     async def _punish_user(
         self, member: discord.Member, reason: str, cfg: dict
@@ -436,7 +418,6 @@ class AutoMod(commands.Cog):
         member = message.author
         now = discord.utils.utcnow()
 
-        # ── Enhanced color coding ──────────────────────────────────────────────
         _COLOR_MAP = {
             "SAFE":      0x22C55E,  # green
             "SUGGESTIVE": 0xF59E0B, # yellow
@@ -457,7 +438,6 @@ class AutoMod(commands.Cog):
         embed = discord.Embed(title=title, color=color, timestamp=now)
         embed.set_thumbnail(url=member.display_avatar.url)
 
-        # ── User & context fields ──────────────────────────────────────────────
         embed.add_field(name="👤 User", value=f"{member.mention} (`{member.id}`)", inline=True)
         embed.add_field(name="📺 Channel", value=message.channel.mention, inline=True)
         embed.add_field(name="💬 Message ID", value=f"`{message.id}`", inline=True)
@@ -477,8 +457,6 @@ class AutoMod(commands.Cog):
                 inline=True,
             )
 
-        # ── AI Detection Summary ───────────────────────────────────────────────
-        # Verdict badge
         verdict_badge = {
             "EXPLICIT": "🔴 EXPLICIT",
             "NSFW":     "🟠 NSFW",
@@ -488,14 +466,12 @@ class AutoMod(commands.Cog):
             "SAFE":     "🟢 SAFE",
         }.get(scan_result.verdict, scan_result.verdict)
 
-        # Content type / branch label
         branch_label = {
             "real":  "📷 Real/Photo",
             "anime": "🎨 Anime/Illustration",
             "both":  "🔀 Both (Uncertain)",
         }.get(scan_result.branch, scan_result.branch)
 
-        # Confidence from reason string (best effort)
         confidence_str = ""
         if scan_result.reason and "score=" in scan_result.reason:
             try:
@@ -516,7 +492,6 @@ class AutoMod(commands.Cog):
             inline=False,
         )
 
-        # ── Detected tags / labels ─────────────────────────────────────────────
         detected_tags = _extract_detected_tags(scan_result)
         if detected_tags:
             tag_lines = [f"`{tag}` — `{score:.2f}`" for tag, score in detected_tags[:8]]
@@ -526,7 +501,6 @@ class AutoMod(commands.Cog):
                 inline=False,
             )
 
-        # ── Reason / model trace ───────────────────────────────────────────────
         if scan_result.reason:
             embed.add_field(
                 name="📊 Reason",
@@ -558,8 +532,6 @@ class AutoMod(commands.Cog):
 
         embed.set_footer(text="NSFW Detection System • Local AI Pipeline | Use buttons below to submit feedback")
 
-        # ── Build combined view: RemoveTimeout + Feedback buttons ─────────────
-        # Serialize scan data for the feedback view to store on click
         try:
             model_scores = _extract_model_scores(scan_result)
             scan_result_payload = json.dumps({
@@ -581,9 +553,7 @@ class AutoMod(commands.Cog):
             scan_result_json=scan_result_payload,
         )
 
-        # If there's also a timeout-removal button, we inject it into the feedback view
         if verdict == "BLOCK" and cfg.get("punishment") == "timeout":
-            # Add the remove-timeout button to the feedback view
             remove_btn = discord.ui.Button(
                 label="Remove Timeout",
                 style=discord.ButtonStyle.success,
@@ -647,7 +617,6 @@ class AutoMod(commands.Cog):
             )
             await log_channel.send(embed=fallback, view=feedback_view)
 
-        # Send image preview as spoiler
         if file_info:
             for item in file_info[:5]:
                 url, fname, size, res = item[0], item[1], item[2], item[3]
@@ -725,7 +694,6 @@ class AutoMod(commands.Cog):
             member = message.author
             now = discord.utils.utcnow()
 
-            # Choose color based on verdict
             color_map = {
                 "SAFE": 0x22C55E,
                 "SUGGESTIVE": 0xF59E0B,
@@ -752,12 +720,10 @@ class AutoMod(commands.Cog):
             )
             embed.set_thumbnail(url=member.display_avatar.url)
 
-            # Basic metadata
             embed.add_field(name="👤 User", value=f"{member.mention}\n`{member.id}`", inline=True)
             embed.add_field(name="📺 Channel", value=message.channel.mention, inline=True)
             embed.add_field(name="💬 Message ID", value=f"`{message.id}`", inline=True)
 
-            # AI Stats
             embed.add_field(
                 name="🧠 AI Council Engine",
                 value=(
@@ -782,11 +748,9 @@ class AutoMod(commands.Cog):
                     inline=False,
                 )
 
-            # File Info — redact raw URL for non-SAFE verdicts
             size_str = f"{size:,} bytes" if size else "Unknown"
             is_nsfw_verdict = scan_result.verdict != "SAFE"
 
-            # Determine the real extension from URL path (fname may be "embed_image")
             _url_path = url.split("?")[0].lower()
             _img_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
             _vid_exts = (".mp4", ".webm", ".mov", ".avi")
@@ -794,7 +758,7 @@ class AutoMod(commands.Cog):
             _is_video = any(_url_path.endswith(e) for e in _vid_exts)
 
             if is_nsfw_verdict:
-                # Never expose the raw URL — moderators can find the original via Message ID
+                # Redact raw URL for NSFW verdicts — moderators can find the original via Message ID
                 media_info_value = _trim_embed_value(
                     f"**Name:** `{fname}`\n"
                     f"**Size:** `{size_str}`\n"
@@ -807,12 +771,9 @@ class AutoMod(commands.Cog):
 
             embed.add_field(name="📎 Media Info", value=media_info_value, inline=False)
 
-            # Image preview — spoilered for any non-SAFE verdict
             if not is_nsfw_verdict and _is_image:
-                # Safe content: show inline in the embed
                 embed.set_image(url=url)
 
-            # ── Build feedback buttons view ───────────────────────────────────
             try:
                 model_scores = _extract_model_scores(scan_result)
                 scan_result_payload = json.dumps({
@@ -836,17 +797,14 @@ class AutoMod(commands.Cog):
 
             embed.set_footer(text="NSFW Bot Debugging Logger • Local Inference | Use buttons below to submit feedback")
             
-            # Always send the main debug embed cleanly without attachments
             await debug_channel.send(embed=embed, view=feedback_view)
 
-            # Send the preview as a separate message for non-SAFE verdicts to ensure reliable spoilering/censoring
             if is_nsfw_verdict:
                 try:
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                             if resp.status == 200:
                                 data = await resp.read()
-                                # Derive a real filename from the URL if fname is generic
                                 base_fname = fname
                                 if not any(fname.lower().endswith(e) for e in _img_exts + _vid_exts):
                                     try:
@@ -889,7 +847,6 @@ class AutoMod(commands.Cog):
         except Exception as e:
             logger.error("Failed to send debug log embed: %s", e, exc_info=True)
 
-    # ── Main listener ─────────────────────────────────────────────────────────
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -902,22 +859,18 @@ class AutoMod(commands.Cog):
             if not cfg.get("enabled", True):
                 return
 
-            # Channel monitoring: if cfg["channels"] is non-empty, only scan those.
-            # If empty, scan all channels in this guild (global enable behaviour).
+            # If cfg["channels"] is non-empty, only scan those; empty = all channels
             guild_channels = cfg.get("channels", [])
             if guild_channels and message.channel.id not in guild_channels:
                 return
 
-            # Check whitelist — roles
             member_role_ids = [r.id for r in message.author.roles]
             if any(rid in cfg.get("whitelisted_roles", []) for rid in member_role_ids):
                 return
 
-            # Check whitelist — users
             if message.author.id in cfg.get("whitelisted_users", []):
                 return
 
-            # Extract media
             media_list = self.extract_media_urls(message)
             if not media_list:
                 return
@@ -929,11 +882,9 @@ class AutoMod(commands.Cog):
                 message.channel.name,
             )
 
-            # ── Per-user rate limiting ────────────────────────────────────────
             uid = message.author.id
             try:
                 async with self._scan_slot(uid):
-                    # Per-guild lock to prevent concurrent GPU inference
                     async with self._guild_lock(message.guild.id):
                     from moderation.pipeline import scan_attachment
                     from utils.database import record_scan
@@ -960,11 +911,9 @@ class AutoMod(commands.Cog):
                             result.reason,
                         )
 
-                        # Send to debug channel if configured, even if SAFE
                         if bot_config.debug_log_channel_id:
                             await self._send_debug_log_embed(message, result, url, fname, size)
 
-                        # Record scan in database
                         cache_hit = result.reason and result.reason.startswith("[Cache HIT]")
                         await record_scan(
                             message_id=str(message.id),
@@ -988,18 +937,15 @@ class AutoMod(commands.Cog):
                     if best_result is None:
                         return
 
-                    # Take action based on verdict
                     file_info = scanned_files
 
                     if best_result.verdict in _BLOCKING_VERDICTS:
-                        # Delete message
                         try:
                             await message.delete()
                             logger.info("🗑️ Deleted message from %s", message.author)
                         except Exception as e:
                             logger.warning("Could not delete message: %s", e)
 
-                        # DM user
                         await self._send_dm(message.author, message.guild.name)
                         await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
                         logger.info(
@@ -1009,12 +955,10 @@ class AutoMod(commands.Cog):
                         )
 
                     elif best_result.verdict == "SAFE":
-                        # Log safe content so moderators can submit feedback (e.g. False Negatives)
-                        # ONLY log static images, NOT GIFs or videos!
+                        # Log safe static images only (not GIFs/videos) so moderators can submit False Negative feedback
                         is_static_image = True
                         gif_vid_exts = (".gif", ".gifv", ".mp4", ".webm", ".mov", ".avi")
-                        
-                        # Check if any media item in the entire message is a GIF or video
+
                         has_gif_or_video = False
                         for m_url, m_fname, _ in media_list:
                             m_name_lower = m_fname.lower()
@@ -1057,7 +1001,6 @@ class AutoMod(commands.Cog):
         if after.author.bot or not after.guild:
             return
 
-        # Fast exit if content and attachment URLs are identical
         before_content = before.content or ""
         after_content = after.content or ""
         before_att = {a.url for a in before.attachments}
@@ -1069,7 +1012,6 @@ class AutoMod(commands.Cog):
         logger.debug("Message %s edited by %s. Re-running moderation.", after.id, after.author)
         await self.on_message(after)
 
-    # ── Legacy scanner commands (preserved for backwards compatibility) ────────
 
     @commands.hybrid_group(invoke_without_command=True, name="scanner", description="NSFW Scanner configuration")
     @commands.has_permissions(manage_messages=True)

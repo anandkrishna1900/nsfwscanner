@@ -1,10 +1,3 @@
-"""
-moderation/pipeline.py — Main orchestration pipeline.
-
-Coordinates pre-filter → gatekeeper → branch(es) → verdict aggregation.
-All heavy inference is wrapped in asyncio.to_thread() so the event loop is never blocked.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -28,15 +21,14 @@ from utils.constants import SEVERITY as _SEVERITY
 @dataclass
 class ScanResult:
     verdict: str                           # "SAFE" | "SUGGESTIVE" | "REVIEW" | "NSFW" | "BLOCK" | "EXPLICIT"
-    reason: str                            # human-readable e.g. "MALE_GENITALIA_EXPOSED (0.73)"
+    reason: str
     branch: str                            # "real" | "anime" | "prefilter_skip" | "both"
-    model: str                             # which model made the final call
+    model: str
     frame_index: Optional[int]            # which frame triggered it (None for images)
     processing_time_ms: float
     pipeline_steps: list[str] = field(default_factory=list)
 
 
-# ── Module-level singletons (lazy init) ───────────────────────────────────────
 import threading
 _init_lock = threading.Lock()
 _prefilter = None
@@ -49,11 +41,9 @@ _initialized = False
 def _ensure_models_initialized(config: "BotConfig") -> None:
     """Initialize all model singletons on first call (thread-safe)."""
     global _prefilter, _gatekeeper, _real_branch, _anime_branch, _initialized
-    # Fast path — no lock needed after init
     if _initialized:
         return
     with _init_lock:
-        # Re-check inside the lock (double-checked locking)
         if _initialized:
             return
 
@@ -64,17 +54,14 @@ def _ensure_models_initialized(config: "BotConfig") -> None:
 
         logger.info("[Pipeline] Initializing models (first-run)…")
 
-        # Pre-filter loads eagerly (it's the only model that stays in memory)
         _prefilter = AdamCoddPrefilter(cache_dir=config.model_cache_dir)
 
-        # Gatekeeper: load lazily but keep in memory (small model)
         try:
             _gatekeeper = ContentTypeRouter(cache_dir=config.model_cache_dir)
         except Exception as e:
             logger.error("[Pipeline] Gatekeeper failed to load: %s — will skip routing", e)
             _gatekeeper = None
 
-        # Branches: instantiated now but internally lazy
         _real_branch = RealBranch(config=config)
 
         try:
@@ -87,7 +74,6 @@ def _ensure_models_initialized(config: "BotConfig") -> None:
         logger.info("[Pipeline] All models initialized")
 
 
-# ── Attachment download ────────────────────────────────────────────────────────
 _http_session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 
@@ -138,8 +124,6 @@ async def _download_attachment(
     logger.debug("[Pipeline] Downloaded %d bytes → %s", downloaded, dest_path)
 
 
-# ── Sync inference helpers (run inside asyncio.to_thread) ─────────────────────
-
 async def warm_models(config: "BotConfig") -> None:
     """Pre-warm models in a background thread so the first scan is fast."""
     try:
@@ -177,8 +161,6 @@ def _severity(verdict: str) -> int:
     return _SEVERITY.get(verdict, 0)
 
 
-# ── Main pipeline ─────────────────────────────────────────────────────────────
-
 async def scan_attachment(
     attachment_url: str,
     config: "BotConfig",
@@ -192,14 +174,12 @@ async def scan_attachment(
     """
     start_time = time.monotonic()
 
-    # Ensure models are ready (lazy init on first call)
     await asyncio.to_thread(_ensure_models_initialized, config)
 
     tmp_path: Optional[str] = None
     suffix = _guess_suffix(attachment_url)
 
     try:
-        # ── Download ──────────────────────────────────────────────────────────
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name
 
@@ -208,7 +188,6 @@ async def scan_attachment(
                 attachment_url, tmp_path, config.max_video_size_mb
             )
         except ValueError as e:
-            # File too large
             elapsed = (time.monotonic() - start_time) * 1000
             return ScanResult(
                 verdict="SAFE",
@@ -225,11 +204,8 @@ async def scan_attachment(
             )
         except Exception as e:
             logger.warning("[Pipeline] Download failed for %s: %s", attachment_url, e)
-            # Re-raise so the caller (on_message) can skip this URL instead of
-            # treating a stale/expired/blocked link as SAFE.
             raise IOError(f"Download error: {e}") from e
 
-        # ── Frame extraction ──────────────────────────────────────────────────
         from moderation.frame_extractor import (
             extract_frames,
             FileTooLargeError,
@@ -277,7 +253,6 @@ async def scan_attachment(
 
         logger.info("[Pipeline] Processing %d frame(s) from %s", len(frames), attachment_url)
 
-        # ── Hash cache check (first frame only) ─────────────────────────────────────
         from utils.hash_cache import compute_phash, get_cached_verdict, store_cached_verdict
         _first_frame_phash = ""
         if frames:
@@ -305,14 +280,12 @@ async def scan_attachment(
                         ],
                     )
 
-        # ── Per-frame scan ────────────────────────────────────────────────────
         best_result: Optional[ScanResult] = None
 
         for frame_idx, frame in enumerate(frames):
             steps = []
             w, h = frame.size
 
-            # Stage 0: Pre-filter
             pf_thresh = config.get_threshold(config.sensitivity.get("prefilter", {}).get("threshold", 0.15))
             prefilter_score = await asyncio.to_thread(_prefilter.score, frame)
             worth_checking = prefilter_score >= pf_thresh or bypass_prefilter
@@ -348,7 +321,6 @@ async def scan_attachment(
                     best_result = frame_scan
                 continue
 
-            # Stage 1: Gatekeeper
             route, confidence = await asyncio.to_thread(_run_gatekeeper, frame)
             logger.debug("[Pipeline] Frame %d → route=%s (%.2f)", frame_idx, route, confidence)
 
@@ -360,7 +332,6 @@ async def scan_attachment(
                 f"  Action: " + ("Routed to Real/Photo Branch" if route == "real" else "Routed to Anime/Illustration Branch" if route == "anime" else "Uncertain - Routing to BOTH branches")
             )
 
-            # Stage 2: Branch(es)
             if route == "real":
                 branch_result = await asyncio.to_thread(_run_real_branch, frame)
                 branch_name = "real"
@@ -399,7 +370,7 @@ async def scan_attachment(
                 w_r18 = fusion_weights.get("anime_rating_r18", 0.25)
                 w_genital = fusion_weights.get("genital_score", 0.30)
                 w_breast = fusion_weights.get("breast_score", 0.15)
-                
+
                 fusion_thresholds = config.sensitivity.get("pipeline_fusion", {}).get("thresholds", {})
                 t_explicit = config.get_threshold(fusion_thresholds.get("explicit_genital_score", 0.60))
                 t_nsfw = config.get_threshold(fusion_thresholds.get("nsfw_breast_score", 0.60))
@@ -428,7 +399,7 @@ async def scan_attachment(
                 )
 
             else:
-                # Uncertain: run both, take higher severity
+                # Uncertain: run both branches, take higher severity
                 real_res = await asyncio.to_thread(_run_real_branch, frame)
                 anime_res = await asyncio.to_thread(_run_anime_branch, frame)
 
@@ -485,7 +456,6 @@ async def scan_attachment(
                     f"  Verdict: {branch_result.verdict}"
                 )
 
-            # Build ScanResult for this frame
             reason = _build_reason(branch_result)
             frame_scan = ScanResult(
                 verdict=branch_result.verdict,
@@ -497,11 +467,9 @@ async def scan_attachment(
                 pipeline_steps=steps
             )
 
-            # Track best result
             if best_result is None or _severity(frame_scan.verdict) > _severity(best_result.verdict):
                 best_result = frame_scan
 
-            # Early exit on BLOCK
             if frame_scan.verdict in {"BLOCK", "NSFW", "EXPLICIT"}:
                 logger.info(
                     "[Pipeline] BLOCK on frame %d — stopping early. Reason: %s",
@@ -513,7 +481,6 @@ async def scan_attachment(
         elapsed = (time.monotonic() - start_time) * 1000
 
         if best_result is None:
-            # All frames skipped by prefilter
             return ScanResult(
                 verdict="SAFE",
                 reason="All frames cleared prefilter",
@@ -537,7 +504,6 @@ async def scan_attachment(
             elapsed,
         )
 
-        # Store result in hash cache for future fast-path
         if _first_frame_phash and not bypass_prefilter:
             await store_cached_verdict(
                 phash_hex=_first_frame_phash,
@@ -551,11 +517,9 @@ async def scan_attachment(
         return best_result
 
     finally:
-        # Clear frames if they exist to release memory immediately
         if "frames" in locals() and isinstance(frames, list):
             frames.clear()
 
-        # Always clean up temp file
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -563,7 +527,6 @@ async def scan_attachment(
             except Exception as e:
                 logger.warning("[Pipeline] Failed to delete temp file %s: %s", tmp_path, e)
 
-        # Aggressive memory cleanup in a background thread to prevent event loop blocking
         def _aggressive_cleanup():
             import gc
             import sys
@@ -579,8 +542,6 @@ async def scan_attachment(
         await asyncio.to_thread(_aggressive_cleanup)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _guess_suffix(url: str) -> str:
     """Guess file extension from URL."""
     from urllib.parse import urlparse
@@ -594,7 +555,6 @@ def _guess_suffix(url: str) -> str:
 def _build_reason(branch_result) -> str:
     """Build a human-readable reason string from a BranchResult."""
     if hasattr(branch_result, 'final_score') and branch_result.final_score > 0:
-        # Anime branch score fusion reason
         tags_part = ""
         if branch_result.detections:
             top = sorted(branch_result.detections, key=lambda x: x[1], reverse=True)

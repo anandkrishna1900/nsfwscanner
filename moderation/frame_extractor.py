@@ -25,20 +25,17 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# Supported extensions
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 GIF_EXTS   = {".gif"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".webm", ".mkv", ".flv"}
 
-# Video scanning constants — hardcoded, not configurable
-_VIDEO_MAX_SECS: int   = 30   # never scan past this timestamp
-_VIDEO_FRAME_INTERVAL: float = 3.0   # one frame every 3 seconds → max 10 frames
+# Never scan past this timestamp; one frame every N seconds → max 10 frames
+_VIDEO_MAX_SECS: int   = 30
+_VIDEO_FRAME_INTERVAL: float = 3.0
 
-# GIF scanning cap — evenly spaced frames; short GIFs (<= cap) are fully scanned
+# Evenly spaced GIF frames; short GIFs (<= cap) are fully scanned
 MAX_GIF_FRAMES: int = 15
 
-
-# ── Custom exceptions ─────────────────────────────────────────────────────────
 
 class FileTooLargeError(Exception):
     """Raised when the file exceeds the configured size limit."""
@@ -47,8 +44,6 @@ class FileTooLargeError(Exception):
 class VideoTooLongError(Exception):
     """Raised when the video exceeds the configured duration limit."""
 
-
-# ── Main entry point ──────────────────────────────────────────────────────────
 
 def extract_frames(
     file_path: str,
@@ -80,7 +75,6 @@ def extract_frames(
     path = Path(file_path)
     ext  = path.suffix.lower()
 
-    # ── Size guard ────────────────────────────────────────────────────────────
     try:
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > max_size_mb:
@@ -92,7 +86,6 @@ def extract_frames(
     except Exception as e:
         logger.warning("Could not check file size for %s: %s", file_path, e)
 
-    # ── Route by extension ────────────────────────────────────────────────────
     if ext in IMAGE_EXTS:
         return _extract_image(file_path)
     elif ext in GIF_EXTS:
@@ -104,8 +97,6 @@ def extract_frames(
         logger.debug("Unknown extension %r — attempting image open", ext)
         return _extract_image(file_path)
 
-
-# ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _to_rgb(img: Image.Image) -> Image.Image:
     """Convert any PIL Image mode to RGB."""
@@ -138,14 +129,12 @@ def _extract_gif(file_path: str) -> List[Image.Image]:
         import imageio.v3 as iio
         import numpy as np
 
-        # First pass: count total frames cheaply via metadata
         try:
             props = iio.improps(file_path, plugin="pillow")
             total_frames: int = props.n_images if props.n_images and props.n_images > 0 else 0
         except Exception:
             total_frames = 0
 
-        # Build the set of frame indices we want to decode
         if total_frames > 0 and total_frames > MAX_GIF_FRAMES:
             step = total_frames / MAX_GIF_FRAMES
             wanted: set[int] = {int(i * step) for i in range(MAX_GIF_FRAMES)}
@@ -156,7 +145,7 @@ def _extract_gif(file_path: str) -> List[Image.Image]:
                 total_frames, len(wanted), file_path,
             )
         else:
-            wanted = set()   # empty = take all
+            wanted = set()
             sample_mode = False
 
         frames: List[Image.Image] = []
@@ -204,7 +193,6 @@ def _extract_video(file_path: str, max_duration_secs: int) -> List[Image.Image]:
         frame_count: int  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         total_duration: float = frame_count / video_fps if video_fps > 0 else 0.0
 
-        # Total-duration guard (e.g. reject videos > 5 minutes)
         if total_duration > max_duration_secs:
             cap.release()
             raise VideoTooLongError(
@@ -212,13 +200,8 @@ def _extract_video(file_path: str, max_duration_secs: int) -> List[Image.Image]:
                 f"{max_duration_secs}s limit."
             )
 
-        # Scan cap: never go past 30 seconds
         scan_end_secs: float = min(total_duration, float(_VIDEO_MAX_SECS))
-
-        # How many video frames between each captured sample
         frame_interval: int = max(1, int(video_fps * _VIDEO_FRAME_INTERVAL))
-
-        # The frame index at which we must stop
         stop_frame: int = int(scan_end_secs * video_fps)
 
         frames: List[Image.Image] = []
@@ -229,7 +212,6 @@ def _extract_video(file_path: str, max_duration_secs: int) -> List[Image.Image]:
             if not ret:
                 break
 
-            # Stop once we've passed the 30-second mark
             if frame_idx >= stop_frame:
                 break
 

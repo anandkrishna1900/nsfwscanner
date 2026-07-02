@@ -1,10 +1,3 @@
-"""
-config.py — BotConfig dataclass loaded from .env
-
-Reads all environment variables using python-dotenv.
-Raises ValueError at startup if DISCORD_TOKEN is missing.
-"""
-
 from __future__ import annotations
 
 import json
@@ -26,31 +19,25 @@ def _parse_int_list(raw: Optional[str]) -> List[int]:
 
 @dataclass
 class BotConfig:
-    # ── Discord ──────────────────────────────────────────────────────────────
     discord_token: str
     prefix: str
     guild_ids: List[int]
 
-    # ── Channel Config ────────────────────────────────────────────────────────
     monitored_channels: List[int]          # empty list → monitor all channels
     monitor_all: bool                      # True if MONITORED_CHANNELS="all"
     log_channel_id: Optional[int]
     admin_role_id: Optional[int]
     debug_log_channel_id: Optional[int]
 
-    # ── AI Model Config ───────────────────────────────────────────────────────
     model_cache_dir: str
     device: str                            # "cuda" or "cpu"
 
-    # ── Video/GIF Limits ─────────────────────────────────────────────────────
     max_video_size_mb: int
     max_video_duration_secs: int
     review_threshold_offset: float
 
-    # ── Database ──────────────────────────────────────────────────────────────
-    sqlite_db_path: str                    # path to the SQLite .db file
+    sqlite_db_path: str
 
-    # ── Sensitivity ───────────────────────────────────────────────────────────
     sensitivity: Dict[str, Any] = field(default_factory=dict)
 
     def get_threshold(self, base_value: float) -> float:
@@ -84,13 +71,12 @@ class BotConfig:
         debug_log_channel_raw = os.getenv("DEBUG_LOG_CHANNEL_ID", "").strip()
         debug_log_channel_id = int(debug_log_channel_raw) if debug_log_channel_raw.isdigit() else None
 
-        # Load sensitivity config
         sensitivity_config = {}
         try:
             with open("sensitivity.json", "r") as f:
                 sensitivity_config = json.load(f)
-        except Exception as e:
-            pass # Fallback to defaults if missing or invalid
+        except Exception:
+            pass
 
         return cls(
             discord_token=token.strip(),

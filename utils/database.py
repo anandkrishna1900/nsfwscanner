@@ -1,10 +1,3 @@
-"""
-utils/database.py — Async SQLite database manager for moderator feedback.
-
-Stores moderation verdicts, model scores (as JSON), and moderator corrections
-for active-learning calibration data preparation.
-"""
-
 from __future__ import annotations
 
 import json
@@ -66,7 +59,6 @@ async def init_db(db_path: str = "./bot.db") -> None:
     async with aiosqlite.connect(_DB_PATH) as db:
         await db.executescript(_INIT_SQL)
         await db.commit()
-    # Also initialise the hash cache table in the same DB
     from utils.hash_cache import init_hash_cache
     await init_hash_cache(db_path)
     logger.info("[Database] Initialized at %s", _DB_PATH)
@@ -176,7 +168,6 @@ async def get_feedback_stats(guild_id: str) -> Dict[str, Any]:
     }
 
     async with aiosqlite.connect(_DB_PATH) as db:
-        # Count verdicts
         async with db.execute(
             """
             SELECT moderator_verdict, COUNT(*) as cnt
@@ -203,7 +194,6 @@ async def get_feedback_stats(guild_id: str) -> Dict[str, Any]:
             stats["fn_rate"] = round(stats["false_negatives"] / total * 100, 1)
             stats["accuracy"] = round(stats["correct"] / total * 100, 1)
 
-        # Top failed tags from FP/FN records
         async with db.execute(
             """
             SELECT detected_tags FROM moderation_feedback
@@ -220,7 +210,6 @@ async def get_feedback_stats(guild_id: str) -> Dict[str, Any]:
         try:
             tags = json.loads(tags_json or "[]")
             for entry in tags:
-                # entry is either a tag string or a tuple/list [tag, score, ...]
                 tag = entry[0] if isinstance(entry, (list, tuple)) else str(entry)
                 tag_counts[tag] = tag_counts.get(tag, 0) + 1
         except Exception:
@@ -229,8 +218,6 @@ async def get_feedback_stats(guild_id: str) -> Dict[str, Any]:
     stats["top_failed_tags"] = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
     return stats
 
-
-# ── Scan logging ──────────────────────────────────────────────────────────────
 
 async def record_scan(
     *,
@@ -246,7 +233,6 @@ async def record_scan(
     processing_time_ms: Optional[float] = None,
     cache_hit: bool = False,
 ) -> None:
-    """Insert a scan event into the scan_log table."""
     try:
         async with aiosqlite.connect(_DB_PATH) as db:
             await db.execute(
@@ -267,13 +253,7 @@ async def record_scan(
         logger.warning("[Database] record_scan failed: %s", e)
 
 
-# ── CSV export ────────────────────────────────────────────────────────────────
-
 async def export_feedback_csv(guild_id: str) -> str:
-    """
-    Export all moderation_feedback rows for a guild as a CSV string.
-    Returns the CSV text (may be very large — caller should write to BytesIO).
-    """
     import csv
     import io
 
@@ -306,14 +286,6 @@ async def export_feedback_csv(guild_id: str) -> str:
 
 
 async def get_scan_stats(guild_id: str) -> Dict[str, Any]:
-    """
-    Compute scan statistics for a guild from the scan_log table.
-
-    Returns a dict with:
-        - total_scans, blocked, reviewed, safe, cache_hits
-        - avg_processing_ms
-        - verdict_breakdown: dict of verdict -> count
-    """
     stats: Dict[str, Any] = {
         "total_scans": 0,
         "blocked": 0,
@@ -358,8 +330,6 @@ async def get_scan_stats(guild_id: str) -> Dict[str, Any]:
 
     return stats
 
-
-# ── Automated cleanup ─────────────────────────────────────────────────────────
 
 async def cleanup_old_records(
     db_path: str = "",
