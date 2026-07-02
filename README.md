@@ -16,13 +16,7 @@ A locally-hosted Discord bot that automatically scans images, GIFs, and videos f
 
 ## Prerequisites
 
-| Requirement | Version |
-|---|---|
-| Python | 3.11 or higher |
-| CUDA Toolkit | 11.x+ (for RTX 2050 / Ampere GPU) |
-| FFmpeg | Any recent version (for video frame extraction) |
-| PostgreSQL | 14+ (for moderation log database) |
-| VRAM | 4 GB minimum (RTX 2050 or better) |
+
 
 ### Install FFmpeg
 
@@ -88,38 +82,7 @@ copy .env.example .env    # Windows
 # cp .env.example .env   # Linux/Mac
 ```
 
-### Required Variables
 
-```env
-# Your bot token from Discord Developer Portal
-DISCORD_TOKEN=your_token_here
-
-# Comma-separated guild IDs (for instant slash command sync)
-GUILD_IDS=123456789012345678,987654321098765432
-
-# Comma-separated channel IDs to monitor, OR "all" for every channel
-MONITORED_CHANNELS=111222333444555666,999888777666555444
-
-# Channel where mod logs are sent
-LOG_CHANNEL_ID=555666777888999000
-
-# AI model download directory
-MODEL_CACHE_DIR=./models
-
-# Use "cuda" for GPU (recommended) or "cpu"
-DEVICE=cuda
-
-# Database
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=yourpassword
-POSTGRES_DB=nsfwbot
-```
-
----
-
-## First-Run: Download Models
-
-Before starting the bot, download all AI models (~1.5 GB total):
 
 ```bash
 python scripts/download_models.py
