@@ -114,10 +114,9 @@ async def get_cached_verdict(
             ) as cursor:
                 rows = await cursor.fetchall()
 
-        for stored_phash, verdict, reason, branch, model in rows:
-            dist = _hamming(phash_hex, stored_phash)
-            if dist <= PHASH_DISTANCE_THRESHOLD:
-                async with aiosqlite.connect(path) as db:
+            for stored_phash, verdict, reason, branch, model in rows:
+                dist = _hamming(phash_hex, stored_phash)
+                if dist <= PHASH_DISTANCE_THRESHOLD:
                     await db.execute(
                         """
                         UPDATE image_hash_cache
@@ -127,11 +126,11 @@ async def get_cached_verdict(
                         (stored_phash,),
                     )
                     await db.commit()
-                logger.debug(
-                    "[HashCache] HIT phash=%s distance=%d verdict=%s",
-                    phash_hex, dist, verdict,
-                )
-                return {"verdict": verdict, "reason": reason, "branch": branch, "model": model}
+                    logger.debug(
+                        "[HashCache] HIT phash=%s distance=%d verdict=%s",
+                        phash_hex, dist, verdict,
+                    )
+                    return {"verdict": verdict, "reason": reason, "branch": branch, "model": model}
 
     except Exception as e:
         logger.warning("[HashCache] Lookup error: %s", e)

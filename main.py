@@ -133,7 +133,6 @@ async def daily_cleanup() -> None:
     """Prune old records from the SQLite database once every 24 hours."""
     try:
         from utils.database import cleanup_old_records
-        from config import config
         deleted = await cleanup_old_records(
             db_path=config.sqlite_db_path,
             feedback_days=90,

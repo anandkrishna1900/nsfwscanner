@@ -19,6 +19,9 @@ from moderation.feedback_manager import _extract_model_scores, _extract_detected
 from utils.constants import SEVERITY as _SEVERITY, BLOCKING_VERDICTS as _BLOCKING_VERDICTS, REVIEW_VERDICTS as _REVIEW_VERDICTS
 import contextlib
 
+logger = logging.getLogger(__name__)
+_EMBED_FIELD_LIMIT: int = 1024  # Discord embed field character hard limit
+
 
 def _trim_embed_value(value: str, limit: int = _EMBED_FIELD_LIMIT) -> str:
     """Trim a Discord embed field value to the 1024-character hard limit."""
@@ -98,49 +101,7 @@ def _human_trace_value(pipeline_steps: list[str]) -> str:
     return _trim_embed_value("\n".join(sections))
 
 
-class RemoveTimeoutView(discord.ui.View):
-    """Button view to remove timeout from the log embed."""
 
-    def __init__(self, user_id: int) -> None:
-        super().__init__(timeout=None)
-        self.user_id = user_id
-
-    @discord.ui.button(label="Remove Timeout", style=discord.ButtonStyle.green, emoji="✅")
-    async def remove_timeout_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        try:
-            if not interaction.user.guild_permissions.moderate_members:
-                return await interaction.response.send_message(
-                    "❌ You don't have permission to do this!", ephemeral=True
-                )
-            member = interaction.guild.get_member(self.user_id)
-            if not member:
-                return await interaction.response.send_message(
-                    "❌ User not found in server!", ephemeral=True
-                )
-            await member.timeout(None, reason=f"Timeout removed by {interaction.user.name}")
-
-            original_embed = interaction.message.embeds[0]
-            original_embed.add_field(
-                name="⚠️ Timeout Status",
-                value=f"**Removed by:** {interaction.user.mention}\n"
-                      f"**At:** <t:{int(discord.utils.utcnow().timestamp())}:F>",
-                inline=False,
-            )
-            original_embed.color = 0x808080
-            button.disabled = True
-            button.label = "Timeout Removed"
-            button.style = discord.ButtonStyle.gray
-            await interaction.response.edit_message(embed=original_embed, view=self)
-            await interaction.followup.send(
-                f"✅ Removed timeout from {member.mention}", ephemeral=True
-            )
-        except Exception as e:
-            logger.error("Failed to remove timeout: %s", e)
-            await interaction.response.send_message(
-                f"❌ Failed to remove timeout: {e}", ephemeral=True
-            )
 
 
 class AutoMod(commands.Cog):
@@ -158,8 +119,20 @@ class AutoMod(commands.Cog):
         self._guild_locks: dict[int, asyncio.Lock] = {}
         self._user_scan_counts: dict[int, int] = {}
         self._user_rate_lock: asyncio.Lock = asyncio.Lock()
+        self._http_session: Optional[aiohttp.ClientSession] = None
         self.load_config()
         logger.info("🤖 AutoMod initialized with local AI pipeline")
+
+    async def cog_unload(self) -> None:
+        """Close the shared HTTP session on cog unload."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """Return (or create) a persistent aiohttp session for preview downloads."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
 
 
     def load_config(self) -> None:
@@ -213,10 +186,13 @@ class AutoMod(commands.Cog):
             "whitelisted_roles": [],
             "whitelisted_users": [],
         }
+        changed = False
         for k, v in defaults.items():
             if k not in self.config[gid]:
                 self.config[gid][k] = v
-        self.save_config()
+                changed = True
+        if changed:
+            self.save_config()
         return self.config[gid]
 
     def _guild_lock(self, guild_id: int) -> asyncio.Lock:
@@ -395,7 +371,7 @@ class AutoMod(commands.Cog):
         self,
         message: discord.Message,
         scan_result,
-        file_info: list[tuple[str, str, int]],
+        file_info: list[tuple],
         verdict: str,
         cfg: dict,
     ) -> None:
@@ -623,8 +599,8 @@ class AutoMod(commands.Cog):
                 is_flagged = res.verdict in ("BLOCK", "REVIEW", "NSFW", "EXPLICIT", "SUGGESTIVE")
                 if verdict == "SAFE" or is_flagged:
                     try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        _session = await self._get_http_session()
+                        async with _session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                                 if resp.status == 200:
                                     data = await resp.read()
                                     safe_fname = fname if fname.upper().startswith("SPOILER_") else f"SPOILER_{fname}"
@@ -801,8 +777,8 @@ class AutoMod(commands.Cog):
 
             if is_nsfw_verdict:
                 try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    _session = await self._get_http_session()
+                    async with _session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                             if resp.status == 200:
                                 data = await resp.read()
                                 base_fname = fname
@@ -886,111 +862,107 @@ class AutoMod(commands.Cog):
             try:
                 async with self._scan_slot(uid):
                     async with self._guild_lock(message.guild.id):
-                    from moderation.pipeline import scan_attachment
-                    from utils.database import record_scan
+                        from moderation.pipeline import scan_attachment
+                        from utils.database import record_scan
 
-                    best_result = None
-                    scanned_files = []
+                        best_result = None
+                        scanned_files = []
 
-                    for url, fname, size in media_list[:5]:
-                        try:
-                            result = await scan_attachment(url, bot_config)
-                        except IOError as e:
-                            # Download failed (404, 403, timeout, etc.) — skip silently
-                            logger.warning("⏭️ Skipping undownloadable URL [%s]: %s", fname, e)
-                            continue
-                        except Exception as e:
-                            logger.error("Pipeline error for %s: %s", url, e, exc_info=True)
-                            continue
+                        for url, fname, size in media_list[:5]:
+                            try:
+                                result = await scan_attachment(url, bot_config)
+                            except IOError as e:
+                                # Download failed — skip silently
+                                logger.warning("⏭️ Skipping undownloadable URL [%s]: %s", fname, e)
+                                continue
+                            except Exception as e:
+                                logger.error("Pipeline error for %s: %s", url, e, exc_info=True)
+                                continue
 
-                        logger.info(
-                            "🔍 [%s] %s → %s (%s)",
-                            message.author.name,
-                            fname,
-                            result.verdict,
-                            result.reason,
-                        )
-
-                        if bot_config.debug_log_channel_id:
-                            await self._send_debug_log_embed(message, result, url, fname, size)
-
-                        cache_hit = result.reason and result.reason.startswith("[Cache HIT]")
-                        await record_scan(
-                            message_id=str(message.id),
-                            guild_id=str(message.guild.id),
-                            channel_id=str(message.channel.id),
-                            user_id=str(message.author.id),
-                            filename=fname,
-                            verdict=result.verdict,
-                            branch=result.branch,
-                            model=result.model,
-                            reason=result.reason,
-                            processing_time_ms=result.processing_time_ms,
-                            cache_hit=cache_hit,
-                        )
-
-                        scanned_files.append((url, fname, size, result))
-
-                        if best_result is None or _SEVERITY.get(result.verdict, 0) > _SEVERITY.get(best_result.verdict, 0):
-                            best_result = result
-
-                    if best_result is None:
-                        return
-
-                    file_info = scanned_files
-
-                    if best_result.verdict in _BLOCKING_VERDICTS:
-                        try:
-                            await message.delete()
-                            logger.info("🗑️ Deleted message from %s", message.author)
-                        except Exception as e:
-                            logger.warning("Could not delete message: %s", e)
-
-                        await self._send_dm(message.author, message.guild.name)
-                        await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
-                        logger.info(
-                            "⚠️ REVIEW flagged for %s in #%s",
-                            message.author,
-                            message.channel.name,
-                        )
-
-                    elif best_result.verdict == "SAFE":
-                        # Log safe static images only (not GIFs/videos) so moderators can submit False Negative feedback
-                        is_static_image = True
-                        gif_vid_exts = (".gif", ".gifv", ".mp4", ".webm", ".mov", ".avi")
-
-                        has_gif_or_video = False
-                        for m_url, m_fname, _ in media_list:
-                            m_name_lower = m_fname.lower()
-                            m_url_lower = m_url.split("?")[0].lower()
-                            if (
-                                any(ext in m_name_lower for ext in gif_vid_exts)
-                                or any(ext in m_url_lower for ext in gif_vid_exts)
-                                or "tenor.com" in m_url_lower
-                                or "giphy.com" in m_url_lower
-                                or "tenor.com" in m_name_lower
-                                or "giphy.com" in m_name_lower
-                                or m_name_lower == "embed_gif"
-                            ):
-                                has_gif_or_video = True
-                                break
-                                
-                        if has_gif_or_video or any(emb.type == "gifv" for emb in message.embeds):
-                            is_static_image = False
-
-                        if is_static_image:
-                            await self._send_log_embed(message, best_result, file_info, "SAFE", cfg)
                             logger.info(
-                                "✅ SAFE static image logged for %s in #%s",
+                                "🔍 [%s] %s → %s (%s)",
+                                message.author.name,
+                                fname,
+                                result.verdict,
+                                result.reason,
+                            )
+
+                            if bot_config.debug_log_channel_id:
+                                await self._send_debug_log_embed(message, result, url, fname, size)
+
+                            cache_hit = result.reason and result.reason.startswith("[Cache HIT]")
+                            await record_scan(
+                                message_id=str(message.id),
+                                guild_id=str(message.guild.id),
+                                channel_id=str(message.channel.id),
+                                user_id=str(message.author.id),
+                                filename=fname,
+                                verdict=result.verdict,
+                                branch=result.branch,
+                                model=result.model,
+                                reason=result.reason,
+                                processing_time_ms=result.processing_time_ms,
+                                cache_hit=cache_hit,
+                            )
+
+                            scanned_files.append((url, fname, size, result))
+
+                            if best_result is None or _SEVERITY.get(result.verdict, 0) > _SEVERITY.get(best_result.verdict, 0):
+                                best_result = result
+
+                        if best_result is None:
+                            return
+
+                        file_info = scanned_files
+
+                        if best_result.verdict in _BLOCKING_VERDICTS:
+                            try:
+                                await message.delete()
+                                logger.info("🗑️ Deleted message from %s", message.author)
+                            except Exception as e:
+                                logger.warning("Could not delete message: %s", e)
+
+                            await self._send_dm(message.author, message.guild.name)
+                            await self._send_log_embed(message, best_result, file_info, "BLOCK", cfg)
+                            logger.info(
+                                "🚨 BLOCKED content from %s in #%s",
                                 message.author,
                                 message.channel.name,
                             )
-                        else:
+
+                        elif best_result.verdict in _REVIEW_VERDICTS:
+                            await self._send_log_embed(message, best_result, file_info, "REVIEW", cfg)
                             logger.info(
-                                "✅ SAFE GIF/video skipped from main moderation log (only logged to debug log) for %s in #%s",
+                                "⚠️ REVIEW flagged for %s in #%s",
                                 message.author,
                                 message.channel.name,
                             )
+
+                        elif best_result.verdict == "SAFE":
+                            # Log safe static images only (not GIFs/videos)
+                            gif_vid_exts = (".gif", ".gifv", ".mp4", ".webm", ".mov", ".avi")
+                            has_gif_or_video = any(
+                                any(ext in m_fname.lower() for ext in gif_vid_exts)
+                                or any(ext in m_url.split("?")[0].lower() for ext in gif_vid_exts)
+                                or "tenor.com" in m_url.lower()
+                                or "giphy.com" in m_url.lower()
+                                or m_fname.lower() == "embed_gif"
+                                for m_url, m_fname, _ in media_list
+                            )
+                            if has_gif_or_video or any(emb.type == "gifv" for emb in message.embeds):
+                                logger.info(
+                                    "✅ SAFE GIF/video — skipping moderation log for %s in #%s",
+                                    message.author, message.channel.name,
+                                )
+                            else:
+                                await self._send_log_embed(message, best_result, file_info, "SAFE", cfg)
+                                logger.info(
+                                    "✅ SAFE image logged for %s in #%s",
+                                    message.author, message.channel.name,
+                                )
+
+            except ValueError:
+                pass  # Rate limit exceeded — silently drop extra scans
 
         except Exception as e:
             logger.error("AutoMod on_message error: %s", e, exc_info=True)
@@ -1003,8 +975,8 @@ class AutoMod(commands.Cog):
 
         before_content = before.content or ""
         after_content = after.content or ""
-        before_att = {a.url for a in before.attachments}
-        after_att = {a.url for a in after.attachments}
+        before_att = {a.id for a in before.attachments}
+        after_att = {a.id for a in after.attachments}
         
         if before_content == after_content and before_att == after_att:
             return

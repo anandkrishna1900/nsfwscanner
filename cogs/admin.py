@@ -1,11 +1,18 @@
+"""
+cogs/admin.py — Compact slash commands for NSFW scanner administration.
 
+All commands require Manage Messages permission.
+New commands: set-timeout, whitelist-role/user, unwhitelist-role/user,
+              clear-cache, user-stats, set-punishment.
+Standalone:   /ping (latency + uptime)
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import Optional
+import time
 
 import discord
 from discord import app_commands
@@ -15,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_FILE = "automod_config.json"
 
-# Defaults mirror get_server_config() in automod.py exactly
-_DEFAULTS = {
+_DEFAULTS: dict = {
     "enabled": True,
     "channels": [],
     "punishment": "timeout",
@@ -27,6 +33,8 @@ _DEFAULTS = {
     "whitelisted_users": [],
 }
 
+
+# ── Config helpers ─────────────────────────────────────────────────────────────
 
 def _load_config() -> dict:
     try:
@@ -41,9 +49,7 @@ def _save_config(data: dict) -> None:
     dir_name = os.path.dirname(os.path.abspath(_CONFIG_FILE)) or "."
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", dir=dir_name, suffix=".tmp", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, suffix=".tmp", delete=False) as tmp:
             json.dump(data, tmp, indent=4)
             tmp_path = tmp.name
         os.replace(tmp_path, _CONFIG_FILE)
@@ -57,23 +63,21 @@ def _save_config(data: dict) -> None:
 
 
 def _get_guild(data: dict, guild_id: str) -> dict:
-    """Return the guild sub-dict, creating it with defaults if missing."""
+    """Return the guild config sub-dict, creating and back-filling defaults if missing."""
     if guild_id not in data:
         data[guild_id] = dict(_DEFAULTS)
-    # Back-fill any missing keys
-    for k, v in _DEFAULTS.items():
-        if k not in data[guild_id]:
-            data[guild_id][k] = v
+    else:
+        for k, v in _DEFAULTS.items():
+            if k not in data[guild_id]:
+                data[guild_id][k] = v
     return data[guild_id]
 
 
-def _has_manage_messages():
-    """Check decorator: requires Manage Messages."""
+def _requires_manage_messages() -> app_commands.check:
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.user.guild_permissions.manage_messages:
             await interaction.response.send_message(
-                "❌ You need **Manage Messages** permission to use this command.",
-                ephemeral=True,
+                "\u274c You need **Manage Messages** permission.", ephemeral=True
             )
             return False
         return True
@@ -81,463 +85,493 @@ def _has_manage_messages():
 
 
 class NSFWAdminCog(commands.Cog):
-    """Admin slash commands for the local NSFW AI scanner."""
+    """Admin slash commands for the NSFW AI scanner."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    nsfw_group = app_commands.Group(
+    nsfw = app_commands.Group(
         name="nsfw",
         description="NSFW scanner admin commands (requires Manage Messages)",
     )
 
-    @nsfw_group.command(name="enable", description="Add a channel to NSFW monitoring")
-    @_has_manage_messages()
+    # ── Channel management ────────────────────────────────────────────────────
+
+    @nsfw.command(name="enable", description="Add a channel to NSFW monitoring")
+    @_requires_manage_messages()
     async def nsfw_enable(
-        self,
-        interaction: discord.Interaction,
-        channel: discord.TextChannel,
+        self, interaction: discord.Interaction, channel: discord.TextChannel
     ) -> None:
-        """Enable NSFW scanning for a specific channel."""
         guild_id = str(interaction.guild_id)
         data = _load_config()
-        guild_cfg = _get_guild(data, guild_id)
-
-        if channel.id in guild_cfg["channels"]:
+        cfg = _get_guild(data, guild_id)
+        if channel.id in cfg["channels"]:
             await interaction.response.send_message(
-                f"ℹ️ {channel.mention} is already being monitored.", ephemeral=True
+                f"\u2139\ufe0f {channel.mention} is already monitored.", ephemeral=True
             )
             return
-
-        guild_cfg["channels"].append(channel.id)
+        cfg["channels"].append(channel.id)
         _save_config(data)
-
-        embed = discord.Embed(
-            title="✅ Channel Added to Monitoring",
-            description=f"{channel.mention} will now be scanned for explicit content.",
-            color=0x22C55E,
+        await interaction.response.send_message(
+            f"\u2705 Now scanning {channel.mention} for NSFW content.", ephemeral=True
         )
-        embed.set_footer(text="Use /nsfw status to see all monitored channels")
-        await interaction.response.send_message(embed=embed)
-        logger.info("Guild %s: added #%s to NSFW monitoring", guild_id, channel.name)
 
-    @nsfw_group.command(name="disable", description="Remove a channel from NSFW monitoring")
-    @_has_manage_messages()
+    @nsfw.command(name="disable", description="Remove a channel from NSFW monitoring")
+    @_requires_manage_messages()
     async def nsfw_disable(
-        self,
-        interaction: discord.Interaction,
-        channel: discord.TextChannel,
+        self, interaction: discord.Interaction, channel: discord.TextChannel
     ) -> None:
-        """Disable NSFW scanning for a specific channel."""
         guild_id = str(interaction.guild_id)
         data = _load_config()
-        guild_cfg = _get_guild(data, guild_id)
-
-        if channel.id not in guild_cfg["channels"]:
+        cfg = _get_guild(data, guild_id)
+        if channel.id not in cfg["channels"]:
             await interaction.response.send_message(
-                f"ℹ️ {channel.mention} is not currently being monitored.", ephemeral=True
+                f"\u2139\ufe0f {channel.mention} is not being monitored.", ephemeral=True
             )
             return
-
-        guild_cfg["channels"].remove(channel.id)
+        cfg["channels"].remove(channel.id)
         _save_config(data)
-
-        embed = discord.Embed(
-            title="🔕 Channel Removed from Monitoring",
-            description=f"{channel.mention} will no longer be scanned.",
-            color=0xEF4444,
+        await interaction.response.send_message(
+            f"\U0001f515 Stopped scanning {channel.mention}.", ephemeral=True
         )
-        await interaction.response.send_message(embed=embed)
-        logger.info("Guild %s: removed #%s from NSFW monitoring", guild_id, channel.name)
 
-    @nsfw_group.command(name="status", description="Show NSFW scanner status and monitored channels")
-    @_has_manage_messages()
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    @nsfw.command(name="status", description="Show scanner status for this server")
+    @_requires_manage_messages()
     async def nsfw_status(self, interaction: discord.Interaction) -> None:
-        """Display current scanner status, monitored channels, and model info."""
         await interaction.response.defer(ephemeral=True)
-
         try:
             from config import config as bot_config
             from moderation import pipeline as pl
-
             guild_id = str(interaction.guild_id)
             data = _load_config()
-            guild_cfg = _get_guild(data, guild_id)
-            guild_channels: list[int] = guild_cfg.get("channels", [])
+            cfg = _get_guild(data, guild_id)
+            channels = cfg.get("channels", [])
+            ch_parts = []
+            for cid in channels:
+                ch = interaction.guild.get_channel(cid)
+                ch_parts.append(ch.mention if ch else f"`{cid}`")
+            ch_str = " ".join(ch_parts) or "All channels"
 
-            if guild_channels:
-                mentions = []
-                for cid in guild_channels:
-                    ch = interaction.guild.get_channel(cid)
-                    mentions.append(ch.mention if ch else f"`{cid}`")
-                channels_text = "\n".join(mentions)
+            if pl._initialized:
+                loaded = [n for n, m in [
+                    ("prefilter", pl._prefilter), ("gatekeeper", pl._gatekeeper),
+                    ("real", pl._real_branch), ("anime", pl._anime_branch),
+                ] if m]
+                model_str = "\u2705 " + " \u00b7 ".join(loaded) if loaded else "\u26a0\ufe0f None loaded"
             else:
-                channels_text = "All channels (no specific channels configured)"
+                model_str = "\u23f3 Not loaded yet"
 
-            enabled_text = "🟢 Enabled" if guild_cfg.get("enabled", True) else "🔴 Disabled"
-
-            loaded = pl._initialized
-            model_lines = []
-            if loaded:
-                if pl._prefilter:
-                    model_lines.append("✅ `prefilter` (AdamCodd ViT)")
-                if pl._gatekeeper:
-                    model_lines.append("✅ `gatekeeper` (deepghs/anime_real_cls)")
-                if pl._real_branch:
-                    model_lines.append("✅ `real_branch` (NudeNet)")
-                if pl._anime_branch:
-                    model_lines.append("✅ `anime_branch` (WDv3 + deepghs/anime_rating)")
-            else:
-                model_lines = ["⏳ Models not yet initialized (loads on first scan)"]
-
-            vram_text = "N/A"
+            vram_str = "N/A"
             try:
                 import torch
                 if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated() / 1e6
-                    reserved = torch.cuda.memory_reserved() / 1e6
-                    total = torch.cuda.get_device_properties(0).total_memory / 1e6
-                    vram_text = (
-                        f"{allocated:.0f} MB allocated / "
-                        f"{reserved:.0f} MB reserved / "
-                        f"{total:.0f} MB total"
-                    )
+                    alloc = torch.cuda.memory_allocated() / 1e6
+                    total_mem = torch.cuda.get_device_properties(0).total_memory / 1e6
+                    vram_str = f"{alloc:.0f}/{total_mem:.0f} MB"
             except Exception:
                 pass
 
-            embed = discord.Embed(
-                title="🤖 NSFW Scanner Status",
-                color=0x6366F1,
-                timestamp=discord.utils.utcnow(),
-            )
-            embed.add_field(name="⚙️ Scanner", value=enabled_text, inline=True)
-            embed.add_field(name="🔨 Punishment", value=guild_cfg.get("punishment", "timeout").title(), inline=True)
-            embed.add_field(name="📡 Monitored Channels", value=channels_text, inline=False)
-            embed.add_field(name="🧠 AI Models", value="\n".join(model_lines), inline=False)
-            embed.add_field(name="💾 VRAM Usage", value=vram_text, inline=False)
-            embed.add_field(name="⚙️ Device", value=bot_config.device.upper(), inline=True)
-            embed.add_field(name="📁 Model Cache", value=f"`{bot_config.model_cache_dir}`", inline=True)
-            embed.set_footer(text="Local AI Pipeline — No external APIs")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            on_off = "\U0001f7e2 On" if cfg.get("enabled", True) else "\U0001f534 Off"
+            punishment = cfg.get("punishment", "timeout")
+            timeout_min = cfg.get("timeout_duration", 10)
+            punish_str = punishment + (f" ({timeout_min}m)" if punishment == "timeout" else "")
+            wl_roles = len(cfg.get("whitelisted_roles", []))
+            wl_users = len(cfg.get("whitelisted_users", []))
 
+            embed = discord.Embed(
+                title="\U0001f916 NSFW Scanner Status", color=0x6366F1,
+                timestamp=discord.utils.utcnow()
+            )
+            embed.add_field(name="State", value=on_off, inline=True)
+            embed.add_field(name="Punishment", value=punish_str, inline=True)
+            embed.add_field(name="Device", value=bot_config.device.upper(), inline=True)
+            embed.add_field(name="Channels", value=ch_str, inline=False)
+            embed.add_field(name="Models", value=model_str, inline=True)
+            embed.add_field(name="VRAM", value=vram_str, inline=True)
+            if wl_roles or wl_users:
+                embed.add_field(
+                    name="Whitelisted",
+                    value=f"Roles: `{wl_roles}` \u00b7 Users: `{wl_users}`",
+                    inline=True,
+                )
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
             logger.error("nsfw status error: %s", e, exc_info=True)
-            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+            await interaction.followup.send(f"\u274c Error: {e}", ephemeral=True)
 
-    @nsfw_group.command(name="test", description="Test the NSFW scanner on an attached image (no action taken)")
-    @_has_manage_messages()
+    # ── Test ──────────────────────────────────────────────────────────────────
+
+    @nsfw.command(name="test", description="Scan an attachment (no moderation action taken)")
+    @_requires_manage_messages()
     async def nsfw_test(
-        self,
-        interaction: discord.Interaction,
-        attachment: discord.Attachment,
+        self, interaction: discord.Interaction, attachment: discord.Attachment
     ) -> None:
-        """Run the full pipeline on an image and report back — no deletion or punishment."""
         await interaction.response.defer(ephemeral=True)
-
         try:
             from config import config as bot_config
             from moderation.pipeline import scan_attachment
-
             result = await scan_attachment(attachment.url, bot_config, bypass_prefilter=True)
-
-            verdict_emoji = {
-                "EXPLICIT": "🚨",
-                "NSFW": "🚨",
-                "BLOCK": "🚨",
-                "SUGGESTIVE": "⚠️",
-                "REVIEW": "⚠️",
-                "SAFE": "✅",
-            }.get(result.verdict, "❓")
-            color = {
-                "EXPLICIT": 0xDC2626,
-                "NSFW": 0xEF4444,
-                "BLOCK": 0xFF4444,
-                "SUGGESTIVE": 0xFFA500,
-                "REVIEW": 0xFFA500,
-                "SAFE": 0x22C55E,
-            }.get(result.verdict, 0x888888)
-
+            EMOJI = {
+                "EXPLICIT": "\U0001f534", "NSFW": "\U0001f7e0",
+                "BLOCK": "\U0001f7e0", "SUGGESTIVE": "\U0001f7e1",
+                "REVIEW": "\U0001f7e1", "SAFE": "\U0001f7e2",
+            }
+            COLOR = {
+                "EXPLICIT": 0xDC2626, "NSFW": 0xEF4444, "BLOCK": 0xFF4444,
+                "SUGGESTIVE": 0xFFA500, "REVIEW": 0xFFA500, "SAFE": 0x22C55E,
+            }
             embed = discord.Embed(
-                title=f"{verdict_emoji} Scan Result: {result.verdict}",
-                color=color,
+                title=f"{EMOJI.get(result.verdict, '?')} {result.verdict} \u2014 {attachment.filename}",
+                color=COLOR.get(result.verdict, 0x888888),
                 timestamp=discord.utils.utcnow(),
             )
-            embed.add_field(name="File", value=attachment.filename, inline=True)
-            embed.add_field(name="Verdict", value=f"`{result.verdict}`", inline=True)
-            embed.add_field(name="Branch", value=result.branch, inline=True)
-            embed.add_field(name="Model", value=result.model, inline=True)
-            embed.add_field(name="Reason", value=result.reason or "—", inline=False)
-            embed.add_field(name="Processing Time", value=f"{result.processing_time_ms:.0f}ms", inline=True)
-            if result.frame_index is not None:
-                embed.add_field(name="Triggered Frame", value=f"#{result.frame_index}", inline=True)
-
+            embed.add_field(name="Branch", value=result.branch or "\u2014", inline=True)
+            embed.add_field(name="Model", value=result.model or "\u2014", inline=True)
+            embed.add_field(name="Time", value=f"{result.processing_time_ms:.0f}ms", inline=True)
+            embed.add_field(name="Reason", value=(result.reason or "\u2014")[:1024], inline=False)
             if getattr(result, "pipeline_steps", None):
-                steps_text = "\n\n".join(result.pipeline_steps)
-                if len(steps_text) > 980:
-                    steps_text = steps_text[:980] + "\n... [Trace truncated due to character limit]"
-                embed.add_field(
-                    name="📋 AI Model Council Verification Trace",
-                    value=f"```yaml\n{steps_text}\n```",
-                    inline=False,
-                )
-
-            embed.set_footer(text="Test mode — no action was taken regardless of verdict")
-
+                steps = "\n\n".join(result.pipeline_steps)
+                if len(steps) > 900:
+                    steps = steps[:900] + "\n\u2026[truncated]"
+                embed.add_field(name="Trace", value=f"```yaml\n{steps}\n```", inline=False)
+            embed.set_footer(text="Test mode \u2014 no action taken")
             await interaction.followup.send(embed=embed, ephemeral=True)
-
         except Exception as e:
             logger.error("nsfw test error: %s", e, exc_info=True)
-            await interaction.followup.send(f"❌ Scan failed: {e}", ephemeral=True)
+            await interaction.followup.send(f"\u274c Scan failed: {e}", ephemeral=True)
 
-    @nsfw_group.command(
-        name="feedback-stats",
-        description="Show moderator feedback statistics and model accuracy estimates",
-    )
-    @_has_manage_messages()
-    async def nsfw_feedback_stats(self, interaction: discord.Interaction) -> None:
-        """Display active-learning feedback statistics for this guild."""
-        await interaction.response.defer(ephemeral=True)
+    # ── Stats ─────────────────────────────────────────────────────────────────
 
-        try:
-            from utils.database import get_feedback_stats
-
-            guild_id = str(interaction.guild_id)
-            stats = await get_feedback_stats(guild_id)
-
-            total = stats["total_logged"]
-
-            if total == 0:
-                embed = discord.Embed(
-                    title="📊 Moderator Feedback Stats",
-                    description=(
-                        "No feedback has been submitted yet for this server.\n\n"
-                        "Use the **✅ Correct Detection**, **❌ False Positive**, "
-                        "and **⚠️ False Negative** buttons on moderation log embeds to collect data."
-                    ),
-                    color=0x6366F1,
-                    timestamp=discord.utils.utcnow(),
-                )
-                embed.set_footer(text="Active Learning Feedback System")
-                await interaction.followup.send(embed=embed, ephemeral=True)
-                return
-
-            accuracy = stats["accuracy"]
-            color = (
-                0x22C55E if accuracy >= 80
-                else 0xF59E0B if accuracy >= 60
-                else 0xEF4444
-            )
-
-            embed = discord.Embed(
-                title="📊 Moderator Feedback Stats",
-                description=(
-                    f"Based on **{total}** moderator feedback submissions for this server.\n"
-                    f"This data is used to calibrate future ML model improvements."
-                ),
-                color=color,
-                timestamp=discord.utils.utcnow(),
-            )
-
-            embed.add_field(
-                name="📈 Feedback Summary",
-                value=(
-                    f"**Total Logged:** `{total}`\n"
-                    f"**✅ Correct:** `{stats['correct']}`\n"
-                    f"**❌ False Positives:** `{stats['false_positives']}`\n"
-                    f"**⚠️ False Negatives:** `{stats['false_negatives']}`"
-                ),
-                inline=True,
-            )
-
-            embed.add_field(
-                name="📉 Error Rates",
-                value=(
-                    f"**FP Rate:** `{stats['fp_rate']}%`\n"
-                    f"**FN Rate:** `{stats['fn_rate']}%`\n"
-                    f"**Accuracy:** `{accuracy}%`\n"
-                ),
-                inline=True,
-            )
-
-            filled = int(accuracy / 10)
-            bar = "🟩" * filled + "⬜" * (10 - filled)
-            embed.add_field(
-                name="🎯 Accuracy Bar",
-                value=f"{bar}\n`{accuracy}%` model precision",
-                inline=False,
-            )
-
-            top_tags = stats.get("top_failed_tags", [])
-            if top_tags:
-                tag_lines = [f"`{tag}` — **{count}** failures" for tag, count in top_tags[:8]]
-                embed.add_field(
-                    name="🔍 Most Commonly Misidentified Tags",
-                    value="\n".join(tag_lines),
-                    inline=False,
-                )
-
-            embed.set_footer(
-                text="Active Learning Feedback System • Data used for future ML calibration only"
-            )
-
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-        except Exception as e:
-            logger.error("nsfw feedback-stats error: %s", e, exc_info=True)
-            await interaction.followup.send(f"❌ Error fetching stats: {e}", ephemeral=True)
-
-    @nsfw_group.command(
-        name="stats",
-        description="Show overall scan volume, verdict breakdown, and model accuracy",
-    )
-    @_has_manage_messages()
+    @nsfw.command(name="stats", description="Compact scan volume and accuracy overview")
+    @_requires_manage_messages()
     async def nsfw_stats(self, interaction: discord.Interaction) -> None:
-        """Display combined scan stats and feedback accuracy for this guild."""
         await interaction.response.defer(ephemeral=True)
-
         try:
             from utils.database import get_scan_stats, get_feedback_stats
-            from utils.hash_cache import _DB_PATH as _hc_db
-
-            guild_id = str(interaction.guild_id)
-            scan_stats = await get_scan_stats(guild_id)
-            fb_stats = await get_feedback_stats(guild_id)
-
-            total = scan_stats["total_scans"]
-
-            embed = discord.Embed(
-                title="📊 NSFW Scanner — Full Statistics",
-                color=0x6366F1,
-                timestamp=discord.utils.utcnow(),
-            )
-
+            scan = await get_scan_stats(str(interaction.guild_id))
+            fb = await get_feedback_stats(str(interaction.guild_id))
+            total = scan["total_scans"]
             if total == 0:
-                embed.description = (
-                    "No scans have been logged yet for this server.\n"
-                    "Stats populate automatically as media is posted in monitored channels."
-                )
-                embed.set_footer(text="NSFW Bot Analytics")
-                await interaction.followup.send(embed=embed, ephemeral=True)
-                return
-
-            cache_pct = round(scan_stats["cache_hits"] / total * 100, 1) if total else 0.0
-            embed.add_field(
-                name="📈 Scan Volume",
-                value=(
-                    f"**Total Scans:** `{total:,}`\n"
-                    f"**🚨 Blocked:** `{scan_stats['blocked']:,}`\n"
-                    f"**⚠️ Reviewed:** `{scan_stats['reviewed']:,}`\n"
-                    f"**✅ Safe:** `{scan_stats['safe']:,}`\n"
-                    f"**⚡ Cache Hits:** `{scan_stats['cache_hits']:,}` (`{cache_pct}%`)"
-                ),
-                inline=True,
-            )
-
-            bd = scan_stats["verdict_breakdown"]
-            bd_lines = "\n".join(
-                f"`{v}`: **{c:,}**" for v, c in sorted(bd.items(), key=lambda x: -x[1])
-            )
-            embed.add_field(
-                name="🗂️ Verdict Breakdown",
-                value=bd_lines or "No data",
-                inline=True,
-            )
-
-            # ── Performance ───────────────────────────────────────────────
-            embed.add_field(
-                name="⏱️ Avg Processing Time",
-                value=f"`{scan_stats['avg_processing_ms']:.0f} ms` per scan",
-                inline=True,
-            )
-
-            # ── Feedback accuracy (if any) ────────────────────────────────
-            fb_total = fb_stats["total_logged"]
-            if fb_total > 0:
-                accuracy = fb_stats["accuracy"]
-                color_bar = "🟩" * int(accuracy / 10) + "⬜" * (10 - int(accuracy / 10))
-                embed.add_field(
-                    name="🎯 Moderator-Verified Accuracy",
-                    value=(
-                        f"{color_bar}\n"
-                        f"`{accuracy}%` on {fb_total} reviewed cases\n"
-                        f"FP rate: `{fb_stats['fp_rate']}%` • FN rate: `{fb_stats['fn_rate']}%`"
-                    ),
-                    inline=False,
-                )
-
-                top_tags = fb_stats.get("top_failed_tags", [])
-                if top_tags:
-                    tag_lines = [f"`{tag}` — {count} misses" for tag, count in top_tags[:6]]
-                    embed.add_field(
-                        name="🔍 Top Misidentified Tags",
-                        value="\n".join(tag_lines),
-                        inline=False,
-                    )
-            else:
-                embed.add_field(
-                    name="🎯 Moderator Feedback",
-                    value=(
-                        "No feedback submitted yet.\n"
-                        "Use the **✅ / ❌ / ⚠️** buttons on log embeds to track accuracy."
-                    ),
-                    inline=False,
-                )
-
-            embed.set_footer(text="NSFW Bot Analytics • /nsfw export to download raw CSV")
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-        except Exception as e:
-            logger.error("nsfw stats error: %s", e, exc_info=True)
-            await interaction.followup.send(f"❌ Error fetching stats: {e}", ephemeral=True)
-
-
-    @nsfw_group.command(
-        name="export",
-        description="Download all moderator feedback data as a CSV file",
-    )
-    @_has_manage_messages()
-    async def nsfw_export(self, interaction: discord.Interaction) -> None:
-        """Export moderation_feedback table for this guild as a .csv attachment."""
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            from utils.database import export_feedback_csv
-            import io
-
-            guild_id = str(interaction.guild_id)
-            csv_text = await export_feedback_csv(guild_id)
-
-            if not csv_text.strip() or csv_text.count("\n") <= 1:
                 await interaction.followup.send(
-                    "ℹ️ No feedback data has been recorded for this server yet.",
+                    "\U0001f4ca No scans yet \u2014 stats will appear after media is posted.",
                     ephemeral=True,
                 )
                 return
+            cache_pct = round(scan["cache_hits"] / total * 100, 1) if total else 0.0
+            bd = scan["verdict_breakdown"]
+            bd_str = " \u00b7 ".join(
+                f"`{v}:{c}`" for v, c in sorted(bd.items(), key=lambda x: -x[1])
+            )
+            if fb["total_logged"] > 0:
+                acc = fb["accuracy"]
+                bar = "\U0001f7e9" * int(acc / 10) + "\u2b1c" * (10 - int(acc / 10))
+                fp = fb["fp_rate"]
+                fn = fb["fn_rate"]
+                tot_fb = fb["total_logged"]
+                acc_str = f"{bar} `{acc}%` \u00b7 FP:{fp}% FN:{fn}% ({tot_fb} reviewed)"
+            else:
+                acc_str = "No feedback yet"
+            blocked = scan["blocked"]
+            reviewed = scan["reviewed"]
+            safe = scan["safe"]
+            avg_ms = scan["avg_processing_ms"]
+            embed = discord.Embed(title="\U0001f4ca NSFW Stats", color=0x6366F1, timestamp=discord.utils.utcnow())
+            embed.add_field(
+                name="Scans",
+                value=f"**{total:,}** \u00b7 \U0001f6a8 {blocked:,} blocked \u00b7 \u26a0\ufe0f {reviewed:,} reviewed \u00b7 \u2705 {safe:,} safe",
+                inline=False,
+            )
+            embed.add_field(
+                name="Performance",
+                value=f"\u26a1 Cache `{cache_pct}%` \u00b7 \u23f1 `{avg_ms:.0f}ms` avg",
+                inline=False,
+            )
+            embed.add_field(name="Verdicts", value=bd_str or "\u2014", inline=False)
+            embed.add_field(name="Accuracy", value=acc_str, inline=False)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            logger.error("nsfw stats error: %s", e, exc_info=True)
+            await interaction.followup.send(f"\u274c Error: {e}", ephemeral=True)
 
-            row_count = csv_text.count("\n") - 1  # subtract header row
-            csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
-            filename = f"nsfw_feedback_{interaction.guild_id}.csv"
-            file = discord.File(fp=csv_bytes, filename=filename)
+    # ── Feedback stats ────────────────────────────────────────────────────────
 
+    @nsfw.command(name="feedback-stats", description="Compact moderator feedback accuracy")
+    @_requires_manage_messages()
+    async def nsfw_feedback_stats(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            from utils.database import get_feedback_stats
+            stats = await get_feedback_stats(str(interaction.guild_id))
+            total = stats["total_logged"]
+            if total == 0:
+                await interaction.followup.send(
+                    "\U0001f4ca No feedback yet \u2014 use the \u2705 / \u274c / \u26a0\ufe0f buttons on log embeds.",
+                    ephemeral=True,
+                )
+                return
+            acc = stats["accuracy"]
+            bar = "\U0001f7e9" * int(acc / 10) + "\u2b1c" * (10 - int(acc / 10))
+            color = 0x22C55E if acc >= 80 else 0xF59E0B if acc >= 60 else 0xEF4444
+            correct = stats["correct"]
+            fps = stats["false_positives"]
+            fns = stats["false_negatives"]
+            fp_r = stats["fp_rate"]
+            fn_r = stats["fn_rate"]
+            lines = [
+                f"{bar} **{acc}%** accuracy",
+                f"\u2705 `{correct}` correct \u00b7 \u274c `{fps}` FP \u00b7 \u26a0\ufe0f `{fns}` FN",
+                f"FP: `{fp_r}%` \u00b7 FN: `{fn_r}%` \u00b7 Total: `{total}`",
+            ]
+            top = stats.get("top_failed_tags", [])
+            if top:
+                lines.append("Top missed: " + ", ".join(f"`{t}` ({c})" for t, c in top[:5]))
             embed = discord.Embed(
-                title="📥 Feedback Export Ready",
-                description=(
-                    f"Exported **{row_count:,}** feedback record(s) for this server.\n"
-                    "Columns: `id`, `message_id`, `user_id`, `moderator_id`, "
-                    "`predicted_verdict`, `moderator_verdict`, `branch`, `model`, "
-                    "`processing_time_ms`, `detected_tags`, `created_at`"
-                ),
-                color=0x22C55E,
+                title="\U0001f4ca Feedback Stats",
+                description="\n".join(lines),
+                color=color,
                 timestamp=discord.utils.utcnow(),
             )
-            embed.set_footer(text="Use this data to calibrate future ML model improvements")
-            await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            logger.error("nsfw feedback-stats error: %s", e, exc_info=True)
+            await interaction.followup.send(f"\u274c Error: {e}", ephemeral=True)
 
+    # ── Export ────────────────────────────────────────────────────────────────
+
+    @nsfw.command(name="export", description="Download feedback data as CSV")
+    @_requires_manage_messages()
+    async def nsfw_export(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            import io
+            from utils.database import export_feedback_csv
+            csv_text = await export_feedback_csv(str(interaction.guild_id))
+            if not csv_text.strip() or csv_text.count("\n") <= 1:
+                await interaction.followup.send("\u2139\ufe0f No feedback data to export yet.", ephemeral=True)
+                return
+            rows = csv_text.count("\n") - 1
+            file = discord.File(
+                fp=io.BytesIO(csv_text.encode("utf-8")),
+                filename=f"nsfw_feedback_{interaction.guild_id}.csv",
+            )
+            await interaction.followup.send(
+                f"\U0001f4e5 **{rows:,}** feedback records.", file=file, ephemeral=True
+            )
         except Exception as e:
             logger.error("nsfw export error: %s", e, exc_info=True)
-            await interaction.followup.send(f"❌ Export failed: {e}", ephemeral=True)
+            await interaction.followup.send(f"\u274c Export failed: {e}", ephemeral=True)
 
+    # ── Set punishment ────────────────────────────────────────────────────────
+
+    @nsfw.command(name="set-punishment", description="Set punishment: none / timeout / kick / ban")
+    @_requires_manage_messages()
+    async def nsfw_set_punishment(self, interaction: discord.Interaction, punishment: str) -> None:
+        if punishment.lower() not in ("none", "timeout", "kick", "ban"):
+            await interaction.response.send_message(
+                "\u274c Valid options: `none` \u00b7 `timeout` \u00b7 `kick` \u00b7 `ban`",
+                ephemeral=True,
+            )
+            return
+        data = _load_config()
+        cfg = _get_guild(data, str(interaction.guild_id))
+        cfg["punishment"] = punishment.lower()
+        _save_config(data)
+        await interaction.response.send_message(
+            f"\u2705 Punishment set to **{punishment.lower()}**.", ephemeral=True
+        )
+
+    # ── Set timeout duration ──────────────────────────────────────────────────
+
+    @nsfw.command(name="set-timeout", description="Set timeout duration in minutes (1-10080)")
+    @_requires_manage_messages()
+    async def nsfw_set_timeout(self, interaction: discord.Interaction, minutes: int) -> None:
+        if not 1 <= minutes <= 10080:
+            await interaction.response.send_message(
+                "\u274c Must be 1\u201310\u00a0080 minutes (max 7 days).", ephemeral=True
+            )
+            return
+        data = _load_config()
+        cfg = _get_guild(data, str(interaction.guild_id))
+        cfg["timeout_duration"] = minutes
+        cfg["punishment"] = "timeout"
+        _save_config(data)
+        days, rem = divmod(minutes, 1440)
+        hours, mins = divmod(rem, 60)
+        parts = (
+            ([f"{days}d"] if days else [])
+            + ([f"{hours}h"] if hours else [])
+            + ([f"{mins}m"] if mins else [])
+        )
+        dur = " ".join(parts) or f"{minutes}m"
+        await interaction.response.send_message(
+            f"\u2705 Timeout set to **{dur}** (punishment \u2192 `timeout`).", ephemeral=True
+        )
+
+    # ── Whitelist: roles ──────────────────────────────────────────────────────
+
+    @nsfw.command(name="whitelist-role", description="Exempt a role from NSFW scanning")
+    @_requires_manage_messages()
+    async def nsfw_whitelist_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        data = _load_config()
+        cfg = _get_guild(data, str(interaction.guild_id))
+        if role.id in cfg["whitelisted_roles"]:
+            await interaction.response.send_message(
+                f"\u2139\ufe0f {role.mention} is already whitelisted.", ephemeral=True
+            )
+            return
+        cfg["whitelisted_roles"].append(role.id)
+        _save_config(data)
+        await interaction.response.send_message(
+            f"\u2705 {role.mention} is now whitelisted.", ephemeral=True
+        )
+
+    @nsfw.command(name="unwhitelist-role", description="Remove a role from the scan whitelist")
+    @_requires_manage_messages()
+    async def nsfw_unwhitelist_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        data = _load_config()
+        cfg = _get_guild(data, str(interaction.guild_id))
+        if role.id not in cfg["whitelisted_roles"]:
+            await interaction.response.send_message(
+                f"\u2139\ufe0f {role.mention} is not whitelisted.", ephemeral=True
+            )
+            return
+        cfg["whitelisted_roles"].remove(role.id)
+        _save_config(data)
+        await interaction.response.send_message(
+            f"\u2705 {role.mention} removed from whitelist.", ephemeral=True
+        )
+
+    # ── Whitelist: users ──────────────────────────────────────────────────────
+
+    @nsfw.command(name="whitelist-user", description="Exempt a user from NSFW scanning")
+    @_requires_manage_messages()
+    async def nsfw_whitelist_user(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        data = _load_config()
+        cfg = _get_guild(data, str(interaction.guild_id))
+        if user.id in cfg["whitelisted_users"]:
+            await interaction.response.send_message(
+                f"\u2139\ufe0f {user.mention} is already whitelisted.", ephemeral=True
+            )
+            return
+        cfg["whitelisted_users"].append(user.id)
+        _save_config(data)
+        await interaction.response.send_message(
+            f"\u2705 {user.mention} whitelisted \u2014 their media won't be scanned.", ephemeral=True
+        )
+
+    @nsfw.command(name="unwhitelist-user", description="Remove a user from the scan whitelist")
+    @_requires_manage_messages()
+    async def nsfw_unwhitelist_user(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        data = _load_config()
+        cfg = _get_guild(data, str(interaction.guild_id))
+        if user.id not in cfg["whitelisted_users"]:
+            await interaction.response.send_message(
+                f"\u2139\ufe0f {user.mention} is not whitelisted.", ephemeral=True
+            )
+            return
+        cfg["whitelisted_users"].remove(user.id)
+        _save_config(data)
+        await interaction.response.send_message(
+            f"\u2705 {user.mention} removed from whitelist.", ephemeral=True
+        )
+
+    # ── Clear cache ───────────────────────────────────────────────────────────
+
+    @nsfw.command(name="clear-cache", description="Wipe the image hash cache (forces full rescans)")
+    @_requires_manage_messages()
+    async def nsfw_clear_cache(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            from utils.database import clear_hash_cache
+            from config import config as bot_config
+            deleted = await clear_hash_cache(bot_config.sqlite_db_path)
+            await interaction.followup.send(
+                f"\U0001f5d1\ufe0f Cleared **{deleted:,}** cached hash(es). All new media will be fully rescanned.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error("nsfw clear-cache error: %s", e, exc_info=True)
+            await interaction.followup.send(f"\u274c Failed: {e}", ephemeral=True)
+
+    # ── Per-user stats ────────────────────────────────────────────────────────
+
+    @nsfw.command(name="user-stats", description="Compact scan history for a specific user")
+    @_requires_manage_messages()
+    async def nsfw_user_stats(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            from utils.database import get_scan_stats_by_user
+            stats = await get_scan_stats_by_user(str(interaction.guild_id), str(user.id))
+            total = stats["total_scans"]
+            if total == 0:
+                await interaction.followup.send(
+                    f"\U0001f4ca No scans logged for {user.mention}.", ephemeral=True
+                )
+                return
+            bd = stats["verdict_breakdown"]
+            bd_str = " \u00b7 ".join(
+                f"`{v}:{c}`" for v, c in sorted(bd.items(), key=lambda x: -x[1])
+            )
+            last_str = f"`{stats['last_scan_at']}`" if stats.get("last_scan_at") else "unknown"
+            blocked = stats["blocked"]
+            reviewed = stats["reviewed"]
+            safe = stats["safe"]
+            embed = discord.Embed(
+                title=f"\U0001f464 {user.display_name}",
+                color=0x6366F1,
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.add_field(
+                name="Scans",
+                value=f"**{total}** \u00b7 \U0001f6a8 {blocked} \u00b7 \u26a0\ufe0f {reviewed} \u00b7 \u2705 {safe}",
+                inline=False,
+            )
+            embed.add_field(name="Verdicts", value=bd_str or "\u2014", inline=False)
+            embed.add_field(name="Last Seen", value=last_str, inline=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            logger.error("nsfw user-stats error: %s", e, exc_info=True)
+            await interaction.followup.send(f"\u274c Error: {e}", ephemeral=True)
+
+
+# ── Standalone ping command ────────────────────────────────────────────────────
+
+class PingCog(commands.Cog):
+    """Lightweight latency/uptime check."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+
+    @app_commands.command(name="ping", description="Bot latency and uptime")
+    async def ping(self, interaction: discord.Interaction) -> None:
+        latency_ms = round(self.bot.latency * 1000)
+        uptime_str = "unknown"
+        if hasattr(self.bot, "start_time"):
+            elapsed = int(time.time() - self.bot.start_time)
+            days, rem = divmod(elapsed, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins, secs = divmod(rem, 60)
+            parts = (
+                ([f"{days}d"] if days else [])
+                + ([f"{hours}h"] if hours else [])
+                + ([f"{mins}m"] if mins else [])
+                + [f"{secs}s"]
+            )
+            uptime_str = " ".join(parts)
+        color = 0x22C55E if latency_ms < 100 else 0xF59E0B if latency_ms < 250 else 0xEF4444
+        embed = discord.Embed(
+            title="\U0001f3d3 Pong!",
+            description=f"**Latency:** `{latency_ms}ms`\n**Uptime:** `{uptime_str}`",
+            color=color,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
 
 async def setup(bot: commands.Bot) -> None:
-    cog = NSFWAdminCog(bot)
-    await bot.add_cog(cog)
+    await bot.add_cog(NSFWAdminCog(bot))
+    await bot.add_cog(PingCog(bot))

@@ -5,16 +5,26 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_logger = logging.getLogger(__name__)
 
 
 def _parse_int_list(raw: Optional[str]) -> List[int]:
     """Parse a comma-separated string of integers into a list."""
     if not raw or raw.strip().lower() in ("", "all"):
         return []
-    return [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
+    result: List[int] = []
+    for x in raw.split(","):
+        s = x.strip()
+        if s.isdigit():
+            result.append(int(s))
+        elif s:
+            _logger.warning("[Config] Ignoring non-numeric value in config list: %r", s)
+    return result
 
 
 @dataclass

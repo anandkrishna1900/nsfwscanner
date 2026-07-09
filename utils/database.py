@@ -387,3 +387,68 @@ async def cleanup_old_records(
         deleted["scan_log"],
     )
     return deleted
+
+
+async def get_scan_stats_by_user(guild_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    Return scan statistics for a specific user in a guild.
+
+    Keys: total_scans, blocked, reviewed, safe, verdict_breakdown, last_scan_at
+    """
+    stats: Dict[str, Any] = {
+        "total_scans": 0,
+        "blocked": 0,
+        "reviewed": 0,
+        "safe": 0,
+        "last_scan_at": None,
+        "verdict_breakdown": {},
+    }
+
+    try:
+        async with aiosqlite.connect(_DB_PATH) as db:
+            async with db.execute(
+                """
+                SELECT verdict, COUNT(*) as cnt, MAX(created_at) as last_scan
+                FROM scan_log
+                WHERE guild_id = ? AND user_id = ?
+                GROUP BY verdict
+                """,
+                (guild_id, user_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        for verdict, count, last_scan in rows:
+            stats["total_scans"] += count
+            stats["verdict_breakdown"][verdict] = count
+            if verdict in ("BLOCK", "NSFW", "EXPLICIT"):
+                stats["blocked"] += count
+            elif verdict in ("REVIEW", "SUGGESTIVE"):
+                stats["reviewed"] += count
+            elif verdict == "SAFE":
+                stats["safe"] += count
+            if stats["last_scan_at"] is None or (last_scan and last_scan > stats["last_scan_at"]):
+                stats["last_scan_at"] = last_scan
+
+    except Exception as e:
+        logger.warning("[Database] get_scan_stats_by_user error: %s", e)
+
+    return stats
+
+
+async def clear_hash_cache(db_path: str = "") -> int:
+    """
+    Delete all rows from image_hash_cache.
+
+    Returns the number of deleted rows. Used by /nsfw clear-cache.
+    """
+    path = db_path or _DB_PATH
+    try:
+        async with aiosqlite.connect(path) as db:
+            cur = await db.execute("DELETE FROM image_hash_cache")
+            deleted = cur.rowcount
+            await db.commit()
+        logger.info("[Database] Cleared %d hash cache row(s)", deleted)
+        return deleted
+    except Exception as e:
+        logger.warning("[Database] clear_hash_cache error: %s", e)
+        return 0
